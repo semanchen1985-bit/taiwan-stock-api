@@ -75,18 +75,22 @@ async function getChip(code) {
     const recent = rows.filter(r => dates.includes(r.date));
     const latest = rows.filter(r => r.date === dates.at(-1));
 
-    const sumNet = (name, arr) => arr.filter(r => r.name === name).reduce((s, r) => s + (parseInt(r.buy) - parseInt(r.sell)), 0);
+    // 計算買賣超（buy - sell）
+    const sumNet = (keywords, arr) => arr
+      .filter(r => keywords.some(k => r.name && r.name.includes(k)))
+      .reduce((s, r) => s + (parseInt(r.buy||0) - parseInt(r.sell||0)), 0);
 
     return {
       date: dates.at(-1),
-      foreign5: sumNet("外陸資買賣超股數(不含外資自營商)", recent),
-      foreign1: sumNet("外陸資買賣超股數(不含外資自營商)", latest),
-      site5:    sumNet("投信買賣超股數", recent),
-      site1:    sumNet("投信買賣超股數", latest),
-      dealer5:  sumNet("自營商買賣超股數", recent),
-      dealer1:  sumNet("自營商買賣超股數", latest),
+      foreign5: sumNet(["外資","外陸資"], recent),
+      foreign1: sumNet(["外資","外陸資"], latest),
+      site5:    sumNet(["投信"], recent),
+      site1:    sumNet(["投信"], latest),
+      dealer5:  sumNet(["自營商"], recent),
+      dealer1:  sumNet(["自營商"], latest),
+      rawNames: [...new Set(latest.map(r => r.name))], // debug用
     };
-  } catch(e) {}
+  } catch(e) { console.error("chip error:", e); }
   return null;
 }
 

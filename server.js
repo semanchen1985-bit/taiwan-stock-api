@@ -338,41 +338,59 @@ function calcIndicators(history, currentPrice) {
 // ── 主分析 API ────────────────────────────────────────────
 // ── 熱門股掃描 API ───────────────────────────────────────
 app.get("/scan", async (req, res) => {
-  const mode = req.query.mode || "volume"; // volume | change
+  const mode = req.query.mode || "volume";
   const limit = Math.min(parseInt(req.query.limit || 20), 30);
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) return res.status(500).json({ error: "API key not configured" });
 
   try {
-    // 抓 TWSE 即時大盤資料
-    const ts = Date.now();
-    const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw&json=1&delay=0&_=${ts}`;
-    const r = await fetch(url, { headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" } });
-    
-    // 改抓排行榜
-    const rankUrl = mode === "change"
-      ? `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_MI_LISTNO.tw&json=1&delay=0&_=${ts}`
-      : `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_MI_LISTNO.tw&json=1&delay=0&_=${ts}`;
+    const token = process.env.FINMIND_TOKEN || "";
+    const today = new Date().toISOString().split("T")[0];
+    const yesterday = new Date(Date.now()-2*24*60*60*1000).toISOString().split("T")[0];
 
-    // 用 TWSE 量排行
-    const volUrl = `https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&type=${mode === "change" ? "MS" : "MV"}&_=${ts}`;
-    const r2 = await fetch(volUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
-    const data2 = await r2.json();
-    
-    let stocks = [];
-    if (data2?.data) {
-      stocks = data2.data.slice(0, limit).map(row => ({
-        code: row[2]?.trim(),
-        name: row[3]?.trim(),
-        price: parseFloat(row[8]?.replace(/,/g,"") || 0),
-        change: row[9]?.trim(),
-        changePct: row[10]?.trim(),
-        volume: parseInt(row[7]?.replace(/,/g,"") || 0),
-      })).filter(s => s.code && s.code.match(/^\d{4}$/));
+    // 用 FinMind 抓最近交易日所有股票價格
+    const priceUrl = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&start_date=${yesterday}&end_date=${today}&token=${token}`;
+    const r = await fetch(priceUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const data = await r.json();
+    const rows = data?.data || [];
+
+    if (!rows.length) {
+      return res.json({ error: "無法取得資料，請稍後再試" });
     }
 
+    // 取最新交易日
+    const latestDate = rows.map(r=>r.date).sort().at(-1);
+    let stocks = rows
+      .filter(r => r.date === latestDate && r.stock_id && r.stock_id.match(/^\d{4}$/) && parseFloat(r.close) > 0)
+      .map(r => ({
+        code: r.stock_id,
+        name: r.stock_id,
+        price: parseFloat(r.close),
+        changePct: r.spread && r.open ? ((parseFloat(r.spread)/parseFloat(r.open))*100).toFixed(2)+"%" : "0%",
+        volume: parseInt(r.Trading_Volume/1000) || 0,
+        spread: parseFloat(r.spread) || 0,
+      }));
+
+    // 排序
+    if (mode === "change") {
+      stocks.sort((a,b) => parseFloat(b.changePct) - parseFloat(a.changePct));
+    } else {
+      stocks.sort((a,b) => b.volume - a.volume);
+    }
+    stocks = stocks.slice(0, limit);
+
+    // 從 FinMind 股票清單補名稱
+    try {
+      const infoUrl = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo&token=${token}`;
+      const ir = await fetch(infoUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+      const idata = await ir.json();
+      const nameMap = {};
+      (idata?.data||[]).forEach(s => { nameMap[s.stock_id] = s.stock_name; });
+      stocks = stocks.map(s => ({ ...s, name: nameMap[s.code] || s.code }));
+    } catch(e) {}
+
     if (!stocks.length) {
-      return res.json({ error: "無法取得排行資料，可能非交易時間" });
+      return res.json({ error: "無排行資料，可能非交易時間" });
     }
 
     // 批次抓各股技術指標（只抓近期資料，不用 Claude）

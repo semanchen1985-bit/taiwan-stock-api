@@ -482,9 +482,13 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
     // 徹底清理空行
     const fullText = rawText
       .replace(/\r\n/g, "\n")
-      .replace(/==={3,}/g, "")
-      .replace(/===[^=\n]*\n(\n+)/g, "=== \n")
+      // 只清理純分隔線（不含文字的 === 行），保留段落標題
+      .replace(/^={3,}\s*$/gm, "")
+      // 段落標題後的多餘空行壓縮成一行
+      .replace(/(=== [^\n]+\n)\n+/g, "$1")
+      // 表格前的空行清除
       .replace(/\n+(\|)/g, "\n$1")
+      // 最多保留兩個空行
       .replace(/\n{3,}/g, "\n\n")
       .trim();
 

@@ -320,6 +320,7 @@ app.post("/analyze", async (req, res) => {
 輸出一份專業且具實戰性的台股完整分析報告。
 
 禁止：空泛內容、教科書式解釋、模糊結論、過度保守、AI官腔。
+禁止：在段落之間加入 === 或 --- 分隔線、禁止段落前後有超過1行空行。
 請直接像真正交易員一樣分析。
 
 --------------------------------------------------
@@ -478,10 +479,13 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
       .map(b => b.text)
       .join("");
 
-    // 清理多餘空行
+    // 徹底清理空行
     const fullText = rawText
+      .replace(/\r\n/g, "\n")
+      .replace(/==={3,}/g, "")
+      .replace(/===[^=\n]*\n(\n+)/g, "=== \n")
+      .replace(/\n+(\|)/g, "\n$1")
       .replace(/\n{3,}/g, "\n\n")
-      .replace(/===\s*\n{2,}/g, "===\n")
       .trim();
 
     res.json({

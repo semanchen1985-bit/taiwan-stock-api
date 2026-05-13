@@ -263,85 +263,137 @@ app.post("/analyze", async (req, res) => {
     const ind = calcIndicators(history, price);
     const q = quote || { code, name:code, price, prev:0, change:0, changePct:"0", open:0, high:0, low:0, volume:0, market:"上市" };
 
-    const prompt = `你是資深台股職業交易員，根據以下真實資料分析 ${code} ${q.name}，用繁體中文、台灣交易員口吻輸出完整報告：
+    const prompt = `你是台灣頂級職業交易員與機構級台股研究員，
+熟悉台股主力籌碼、法人邏輯、AI供應鏈、產業循環、
+技術分析、總經分析、波段交易與短線情緒。
 
-【即時行情（TWSE）】
-股票：${q.name}（${code}）${q.market}
-股價：${q.price}元　漲跌：${q.change>=0?"+":""}${q.change}（${q.changePct}%）
-開：${q.open}　高：${q.high}　低：${q.low}　昨收：${q.prev}　量：${q.volume.toLocaleString()}張
+請根據以下真實資料，以台灣職業交易員口吻，使用繁體中文，
+輸出一份專業且具實戰性的台股完整分析報告。
 
-【技術指標（真實計算，共${history.length}筆資料）】
-MA5:${ind.ma5||"—"} MA10:${ind.ma10||"—"} MA20:${ind.ma20||"—"} MA60:${ind.ma60||"—"} MA120:${ind.ma120||"—"} MA240:${ind.ma240||"—"}
-RSI(14):${ind.rsi||"—"} K:${ind.k||"—"} D:${ind.d||"—"}
-MACD:${ind.macd||"—"} Signal:${ind.macdSig||"—"} 柱狀:${ind.macdHist||"—"}
-布林 上:${ind.bollU||"—"} 中:${ind.bollM||"—"} 下:${ind.bollL||"—"}
-均線排列:${ind.maTrend} 量態:${ind.volTrend}
-多空評分：多${ind.bull}分/空${ind.bear}分 → ${ind.direction}
+禁止：空泛內容、教科書式解釋、模糊結論、過度保守、AI官腔。
+請直接像真正交易員一樣分析。
 
-【支撐壓力】
-壓力1:${ind.res1} 壓力2:${ind.res2} 支撐1:${ind.sup1} 支撐2:${ind.sup2} 停損:${ind.stop}
+--------------------------------------------------
+【股票資訊】
+股票代號：${code}
+股票名稱：${q.name}
+市場：${q.market}
 
-【三大法人（FinMind真實資料）】
-${chip ? `外資近5日:${chip.foreign5>0?"+":""}${chip.foreign5.toLocaleString()}股 今日:${chip.foreign1>0?"+":""}${chip.foreign1.toLocaleString()}股
-投信近5日:${chip.site5>0?"+":""}${chip.site5.toLocaleString()}股 今日:${chip.site1>0?"+":""}${chip.site1.toLocaleString()}股
-自營商近5日:${chip.dealer5>0?"+":""}${chip.dealer5.toLocaleString()}股 今日:${chip.dealer1>0?"+":""}${chip.dealer1.toLocaleString()}股` : "三大法人資料暫無"}
+--------------------------------------------------
+【即時行情（TWSE 真實資料）】
+股價：${q.price} 元
+漲跌：${q.change>=0?"+":""}${q.change}（${q.changePct}%）
+開盤：${q.open}　最高：${q.high}　最低：${q.low}　昨收：${q.prev}
+成交量：${q.volume.toLocaleString()} 張
 
-【融資融券（FinMind真實資料）】
-${margin ? `融資餘額:${margin.marginBal.toLocaleString()}張 變化:${margin.marginChange>=0?"+":""}${margin.marginChange.toLocaleString()}張
-融券餘額:${margin.shortBal.toLocaleString()}張 變化:${margin.shortChange>=0?"+":""}${margin.shortChange.toLocaleString()}張` : "融資融券資料暫無"}
+--------------------------------------------------
+【技術指標（真實計算，共 ${history.length} 筆資料）】
+MA5：${ind.ma5||"—"}　MA10：${ind.ma10||"—"}　MA20：${ind.ma20||"—"}
+MA60：${ind.ma60||"—"}　MA120：${ind.ma120||"—"}　MA240（年線）：${ind.ma240||"—"}
+股價與年線距離：${ind.ma240 ? ((q.price - ind.ma240)/ind.ma240*100).toFixed(1)+"%" : "資料不足"}
+年線方向：${ind.ma240 && ind.ma120 ? (ind.ma240 > ind.ma120 ? "下降" : "上升") : "資料不足"}
+RSI(14)：${ind.rsi||"—"}
+K值：${ind.k||"—"}　D值：${ind.d||"—"}
+MACD：${ind.macd||"—"}　Signal：${ind.macdSig||"—"}　柱狀體：${ind.macdHist||"—"}
+布林上軌：${ind.bollU||"—"}　中軌：${ind.bollM||"—"}　下軌：${ind.bollL||"—"}
+均線排列：${ind.maTrend}
+量態：${ind.volTrend}
+多空評分：多${ind.bull}分 / 空${ind.bear}分 → ${ind.direction}
 
-【基本面（FinMind真實資料）】
-${fundamentals ? `本益比(PE):${fundamentals.pe} 股價淨值比(PB):${fundamentals.pb} 殖利率:${fundamentals.div}%` : "基本面資料暫無"}
-${revenue ? `最新月營收:${(revenue.revenue/1000).toFixed(0)}千萬 年增率:${revenue.yoy!=null?revenue.yoy+"%":"—"}` : "月營收資料暫無"}
+--------------------------------------------------
+【支撐壓力（計算值）】
+第一壓力：${ind.res1}　第二壓力：${ind.res2}
+第一支撐：${ind.sup1}　第二支撐：${ind.sup2}　關鍵停損：${ind.stop}
 
-請嚴格按照以下格式輸出，每個段落標題格式必須完全一致：
+--------------------------------------------------
+【三大法人（FinMind 真實資料）】
+${chip ? `外資近5日：${chip.foreign5>0?"+":""}${chip.foreign5.toLocaleString()} 股　今日：${chip.foreign1>0?"+":""}${chip.foreign1.toLocaleString()} 股
+投信近5日：${chip.site5>0?"+":""}${chip.site5.toLocaleString()} 股　今日：${chip.site1>0?"+":""}${chip.site1.toLocaleString()} 股
+自營商近5日：${chip.dealer5>0?"+":""}${chip.dealer5.toLocaleString()} 股　今日：${chip.dealer1>0?"+":""}${chip.dealer1.toLocaleString()} 股` : "三大法人資料暫無"}
+
+--------------------------------------------------
+【融資融券（FinMind 真實資料）】
+${margin ? `融資餘額：${margin.marginBal.toLocaleString()} 張　變化：${margin.marginChange>=0?"+":""}${margin.marginChange.toLocaleString()} 張
+融券餘額：${margin.shortBal.toLocaleString()} 張　變化：${margin.shortChange>=0?"+":""}${margin.shortChange.toLocaleString()} 張
+券資比：${margin.marginBal > 0 ? (margin.shortBal/margin.marginBal*100).toFixed(1)+"%" : "—"}` : "融資融券資料暫無"}
+
+--------------------------------------------------
+【基本面（FinMind 真實資料）】
+${fundamentals ? `本益比(PE)：${fundamentals.pe}　股價淨值比(PB)：${fundamentals.pb}　殖利率：${fundamentals.div}%` : "基本面資料暫無"}
+${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年增率：${revenue.yoy!=null?revenue.yoy+"%":"—"}` : "月營收資料暫無"}
+
+--------------------------------------------------
+
+請務必按照以下固定格式輸出：
 
 === 行情總覽
-（整理今日行情重點，股票基本介紹）
+（今日股價強弱、量能狀況、市場情緒、是否有異常買盤或賣壓）
 
 === 技術分析
-（詳細解讀所有技術指標，說明目前多空態勢）
+（MA5~MA240均線排列、200MA年線方向、股價與年線關係、MACD、KD、RSI、布林通道、量價關係、趨勢方向）
+
+=== 短線分析
+（1~5日：是否過熱、是否適合短打、是否有主力點火、是否有軋空、短線風險）
+
+=== 中線分析
+（1~8週：波段方向、是否主升段、是否法人布局、中線續航力、是否具波段空間）
+
+=== 長線趨勢分析
+（200MA方向、是否站穩年線、長線牛熊位置、是否符合機構趨勢股條件）
+判定：強勢多頭/多頭/中性/偏空/空頭
 
 === 籌碼分析
-（解讀三大法人動向、融資融券狀況，判斷主力意圖）
+（主力、法人、散戶、籌碼集中度、是否有控盤跡象、是否有出貨嫌疑）
 
-=== 基本面
-（PE、PB、殖利率、EPS、ROE、毛利率、月營收年增率解讀）
+=== 籌碼屬性分析
+（判定：外資主導/投信作帳/主力短炒/隔日沖/軋空/法人波段布局/散戶追價，說明原因）
+
+=== 法人分析
+（外資態度、投信態度、自營商態度、是否有連續買超、是否有轉賣訊號）
+
+=== 融資融券分析
+（融資是否過熱、是否散戶過多、是否可能軋空、是否有斷頭風險）
+
+=== 基本面分析
+（PE是否過高、PB是否合理、EPS成長性、毛利率趨勢、營收成長性、ROE水準、是否高估或低估）
 
 === 產業分析
-（產業現況、競爭優勢、未來催化劑）
+（是否為市場主流族群、是否受惠AI、同族群比較強弱、未來成長空間、是否受惠資本支出循環）
+
+=== 市場風格判定
+（目前市場風格：AI主流/傳產輪動/高股息/中小型股/軋空/法人作帳，此股是否符合主流）
+
+=== 位階分析
+（是否高檔、是否低基期、距離52週高低點、是否適合追價、是否容易高檔震盪）
 
 === 風險分析
-（逐項評估：過熱、爆量長黑、法人倒貨、融資過高、估值過高、接近壓力、技術轉弱、財報風險，每項標明高/中/低）
+（技術風險、籌碼風險、法人風險、總經風險、AI泡沫風險、地緣政治風險、高估值風險，每項標明高/中/低）
 
 === 支撐壓力
 第一壓力：${ind.res1}（原因）
 第二壓力：${ind.res2}（原因）
 第一支撐：${ind.sup1}（原因）
 第二支撐：${ind.sup2}（原因）
-建議停損：${ind.stop}
+關鍵停損：${ind.stop}
+關鍵突破：（說明）
 
 === 操作策略
-短線策略（1-5日）：
-波段策略（2-4週）：
-長線策略（數月以上）：
-建議進場點：
-停損點：${ind.stop}
-第一目標：${ind.res1}
-第二目標：${ind.res2}
+【短線策略】最佳進場區、停損位置、是否適合追價
+【波段策略】建議布局方式、建議停利區、是否適合分批布局
+【長線策略】是否適合長抱、合理估值區、是否適合定期布局
 
 === AI綜合分析
-（400字以上，職業交易員口吻，深度分析多空格局、操作邏輯、關鍵催化劑）
+（綜合技術面、籌碼面、基本面、產業面、市場情緒、法人邏輯，直接講出核心看法，500字以上，避免模糊答案）
 
 === 最終裁定
-整體方向：${ind.direction}
-多空評分：多${ind.bull}分/空${ind.bear}分（滿分10分）
-進場建議：
-停損點：${ind.stop}
-第一目標：${ind.res1}
-第二目標：${ind.res2}
-風險等級：
-一句話總結：`;
+判定：強烈看多/偏多/中立/偏空/強烈看空
+短線勝率：（0~100）
+中線勝率：（0~100）
+長線勝率：（0~100）
+現在是否值得買進：是/否/等待
+最佳策略：
+最大風險：
+最值得關注的關鍵訊號：`;
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",

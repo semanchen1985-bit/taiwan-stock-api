@@ -68,6 +68,8 @@ async function getChip(code) {
     const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
     const data = await r.json();
     const rows = data?.data || [];
+    console.log(`三大法人 ${code}: 筆數=${rows.length}, msg=${data?.msg||"ok"}`);
+    if (rows.length > 0) console.log("name欄位範例:", [...new Set(rows.slice(0,6).map(r=>r.name))]);
     if (!rows.length) return null;
 
     // 取最近5個交易日
@@ -249,6 +251,10 @@ app.post("/analyze", async (req, res) => {
   if (!key) return res.status(500).json({ error: "API key not configured" });
 
   try {
+    // Debug: 確認環境變數
+    console.log("ANTHROPIC_API_KEY:", process.env.ANTHROPIC_API_KEY ? "✅有設定" : "❌未設定");
+    console.log("FINMIND_TOKEN:", process.env.FINMIND_TOKEN ? "✅有設定" : "❌未設定");
+    
     // 並行抓所有資料
     const [quote, history, chip, margin, fundamentals, revenue] = await Promise.all([
       getQuote(code),

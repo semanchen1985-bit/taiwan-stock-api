@@ -115,8 +115,7 @@ async function getMargin(code) {
     if (rows.length < 2) return null;
     // 取最新有資料的日期（自動回退）
     const latestDate = rows.at(-1).date;
-    console.log(`融資融券最新日期: ${latestDate}`);
-    console.log("融資融券完整第一筆:", JSON.stringify(rows.at(-1)));
+    console.log(`融資融券最新日期: ${latestDate}, 融資:${rows.at(-1).MarginPurchaseTodayBalance}, 融券:${rows.at(-1).ShortSaleTodayBalance}`);
     const cur  = rows.at(-1);
     const prev = rows.at(-2) || cur;
     // FinMind v4 欄位名稱

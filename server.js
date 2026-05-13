@@ -42,7 +42,7 @@ async function getHistory(code) {
   try {
     const token = process.env.FINMIND_TOKEN || "";
     const end = new Date().toISOString().split("T")[0];
-    const start = new Date(Date.now() - 200*24*60*60*1000).toISOString().split("T")[0];
+    const start = new Date(Date.now() - 400*24*60*60*1000).toISOString().split("T")[0];
     const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${code}&start_date=${start}&end_date=${end}&token=${token}`;
     const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
     const data = await r.json();
@@ -78,19 +78,22 @@ async function getChip(code) {
     const latest = rows.filter(r => r.date === dates.at(-1));
 
     // 計算買賣超（buy - sell）
+    // FinMind name 欄位是英文
+    // Foreign_Investor, Foreign_Dealer_Self = 外資
+    // Investment_Trust = 投信
+    // Dealer_self, Dealer_Hedging = 自營商
     const sumNet = (keywords, arr) => arr
       .filter(r => keywords.some(k => r.name && r.name.includes(k)))
       .reduce((s, r) => s + (parseInt(r.buy||0) - parseInt(r.sell||0)), 0);
 
     return {
       date: dates.at(-1),
-      foreign5: sumNet(["外資","外陸資"], recent),
-      foreign1: sumNet(["外資","外陸資"], latest),
-      site5:    sumNet(["投信"], recent),
-      site1:    sumNet(["投信"], latest),
-      dealer5:  sumNet(["自營商"], recent),
-      dealer1:  sumNet(["自營商"], latest),
-      rawNames: [...new Set(latest.map(r => r.name))], // debug用
+      foreign5: sumNet(["Foreign_Investor", "Foreign_Dealer_Self"], recent),
+      foreign1: sumNet(["Foreign_Investor", "Foreign_Dealer_Self"], latest),
+      site5:    sumNet(["Investment_Trust"], recent),
+      site1:    sumNet(["Investment_Trust"], latest),
+      dealer5:  sumNet(["Dealer_self", "Dealer_Hedging"], recent),
+      dealer1:  sumNet(["Dealer_self", "Dealer_Hedging"], latest),
     };
   } catch(e) { console.error("chip error:", e); }
   return null;
@@ -108,11 +111,17 @@ async function getMargin(code) {
     const rows = data?.data || [];
     if (rows.length < 2) return null;
     const cur = rows.at(-1), prev = rows.at(-2);
+    console.log("融資融券欄位:", Object.keys(cur));
+    // FinMind 欄位：MarginPurchaseBalance, ShortSaleBalance
+    const marginBal  = parseInt(cur.MarginPurchaseBalance || cur.margin_purchase_balance || cur.MarginPurchase || 0);
+    const marginPrev = parseInt(prev.MarginPurchaseBalance || prev.margin_purchase_balance || prev.MarginPurchase || 0);
+    const shortBal   = parseInt(cur.ShortSaleBalance || cur.short_sale_balance || cur.ShortSale || 0);
+    const shortPrev  = parseInt(prev.ShortSaleBalance || prev.short_sale_balance || prev.ShortSale || 0);
     return {
-      marginBal:    parseInt(cur.MarginPurchaseBalance || 0),
-      marginChange: parseInt(cur.MarginPurchaseBalance || 0) - parseInt(prev.MarginPurchaseBalance || 0),
-      shortBal:     parseInt(cur.ShortSaleBalance || 0),
-      shortChange:  parseInt(cur.ShortSaleBalance || 0) - parseInt(prev.ShortSaleBalance || 0),
+      marginBal,
+      marginChange: marginBal - marginPrev,
+      shortBal,
+      shortChange:  shortBal - shortPrev,
     };
   } catch(e) {}
   return null;
@@ -232,14 +241,36 @@ function calcIndicators(history, currentPrice) {
   if(macd&&macd>0)bull++;else bear++;
   if(macdHist&&macdHist>0)bull++;else bear++;
 
+  // ── 週K最高最低（近13週=一季）─────────────────────────
+  let weekHigh = null, weekLow = null;
+  if (history.length >= 5) {
+    const w13 = history.slice(-65);
+    weekHigh = Math.max(...w13.map(h=>h.high||h.close));
+    weekLow  = Math.min(...w13.map(h=>h.low||h.close));
+  }
+  // ── 52週高低（近252個交易日）────────────────────────────
+  let high52w = null, low52w = null;
+  if (history.length >= 50) {
+    const y = history.slice(-252);
+    high52w = Math.max(...y.map(h=>h.high||h.close));
+    low52w  = Math.min(...y.map(h=>h.low||h.close));
+  }
+  // ── 年線方向（MA240 vs MA200）───────────────────────────
+  const ma200 = n>=200 ? +(closes.slice(-200).reduce((s,v)=>s+v,0)/200).toFixed(2) : null;
+  const ma240dir = ma240&&ma200 ? (ma240 > ma200 ? "下降（扣抵偏高）" : "上升（扣抵偏低）") : null;
+  const distFrom240 = ma240&&p ? ((p-ma240)/ma240*100).toFixed(1)+"%" : null;
+
   return {
-    ma5,ma10,ma20,ma60,ma120,ma240,
+    ma5,ma10,ma20,ma60,ma120,ma200,ma240,
     rsi,k,d:d2,macd,macdSig,macdHist,
     bollU,bollM,bollL,
     maTrend,volTrend,
     sup1,sup2,res1,res2,stop,
     bull,bear,
-    direction: bull>bear+2?"偏多":bear>bull+2?"偏空":"中性震盪"
+    direction: bull>bear+2?"偏多":bear>bull+2?"偏空":"中性震盪",
+    high52w, low52w,
+    weekHigh, weekLow,
+    ma240dir, distFrom240,
   };
 }
 
@@ -299,9 +330,11 @@ app.post("/analyze", async (req, res) => {
 --------------------------------------------------
 【技術指標（真實計算，共 ${history.length} 筆資料）】
 MA5：${ind.ma5||"—"}　MA10：${ind.ma10||"—"}　MA20：${ind.ma20||"—"}
-MA60：${ind.ma60||"—"}　MA120：${ind.ma120||"—"}　MA240（年線）：${ind.ma240||"—"}
-股價與年線距離：${ind.ma240 ? ((q.price - ind.ma240)/ind.ma240*100).toFixed(1)+"%" : "資料不足"}
-年線方向：${ind.ma240 && ind.ma120 ? (ind.ma240 > ind.ma120 ? "下降" : "上升") : "資料不足"}
+MA60：${ind.ma60||"—"}　MA120：${ind.ma120||"—"}　MA200：${ind.ma200||"—"}　MA240（年線）：${ind.ma240||"—"}
+股價與年線(MA240)距離：${ind.distFrom240||"資料不足"}
+年線方向：${ind.ma240dir||"資料不足"}
+52週最高：${ind.high52w||"—"}　52週最低：${ind.low52w||"—"}
+近13週高：${ind.weekHigh||"—"}　近13週低：${ind.weekLow||"—"}
 RSI(14)：${ind.rsi||"—"}
 K值：${ind.k||"—"}　D值：${ind.d||"—"}
 MACD：${ind.macd||"—"}　Signal：${ind.macdSig||"—"}　柱狀體：${ind.macdHist||"—"}

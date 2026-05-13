@@ -421,8 +421,7 @@ app.get("/scan", async (req, res) => {
 ${
       results.map(s => 
         `${s.code} ${s.name}：價${s.price} ${s.changePct} RSI${s.rsi||"—"} ${s.maTrend} ${s.direction}`
-      ).join("
-")
+      ).join("\n")
     }
 
 請逐行輸出，格式：代號|一句話建議`;
@@ -446,8 +445,7 @@ ${
     
     // 解析 AI 建議
     const suggestions = {};
-    aiText.split("
-").forEach(line => {
+    aiText.split("\n").forEach(line => {
       const parts = line.split("|");
       if (parts.length >= 2) {
         const code = parts[0].trim().replace(/\D/g,"").slice(0,4);

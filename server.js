@@ -346,14 +346,16 @@ app.get("/scan", async (req, res) => {
   try {
     const token = process.env.FINMIND_TOKEN || "";
     const today = new Date().toISOString().split("T")[0];
-    const yesterday = new Date(Date.now()-2*24*60*60*1000).toISOString().split("T")[0];
+    // 往前抓7天確保有交易日資料
+    const weekAgo = new Date(Date.now()-7*24*60*60*1000).toISOString().split("T")[0];
 
     // 用 FinMind 抓最近交易日所有股票價格
-    const priceUrl = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&start_date=${yesterday}&end_date=${today}&token=${token}`;
+    const priceUrl = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&start_date=${weekAgo}&end_date=${today}&token=${token}`;
     const r = await fetch(priceUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
     const data = await r.json();
     const rows = data?.data || [];
 
+    console.log(`掃描：抓到 ${rows.length} 筆，最新日期：${rows.map(r=>r.date).sort().at(-1)}`);
     if (!rows.length) {
       return res.json({ error: "無法取得資料，請稍後再試" });
     }

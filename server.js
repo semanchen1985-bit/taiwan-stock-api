@@ -14,6 +14,59 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
 });
 
+// ── 股票搜尋 API（即時查 TWSE + FinMind）────────────────
+let stockCache = null;
+let stockCacheTime = 0;
+
+async function getStockList() {
+  // 快取 24 小時
+  if (stockCache && Date.now() - stockCacheTime < 24*60*60*1000) {
+    return stockCache;
+  }
+  try {
+    const token = process.env.FINMIND_TOKEN || "";
+    const r = await fetch(
+      `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo&token=${token}`,
+      { headers: { "User-Agent": "Mozilla/5.0" } }
+    );
+    const data = await r.json();
+    const list = (data?.data || [])
+      .filter(s => s.stock_id && s.stock_name)
+      .map(s => ({ code: s.stock_id, name: s.stock_name, type: s.type || "" }));
+    if (list.length > 0) {
+      stockCache = list;
+      stockCacheTime = Date.now();
+      console.log(`股票清單快取：${list.length} 筆`);
+    }
+    return list;
+  } catch(e) {
+    return stockCache || [];
+  }
+}
+
+app.get("/search", async (req, res) => {
+  const q = (req.query.q || "").trim();
+  if (!q) return res.json([]);
+  try {
+    const list = await getStockList();
+    const results = list
+      .filter(s => s.code.startsWith(q) || s.name.includes(q))
+      .sort((a, b) => {
+        // 代號完全匹配優先
+        if (a.code === q) return -1;
+        if (b.code === q) return 1;
+        // 代號開頭匹配其次
+        if (a.code.startsWith(q) && !b.code.startsWith(q)) return -1;
+        if (!a.code.startsWith(q) && b.code.startsWith(q)) return 1;
+        return a.code.localeCompare(b.code);
+      })
+      .slice(0, 10);
+    res.json(results);
+  } catch(e) {
+    res.json([]);
+  }
+});
+
 // ── TWSE 即時報價 ─────────────────────────────────────────
 async function getQuote(code) {
   try {

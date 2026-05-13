@@ -462,7 +462,7 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-6",
-        max_tokens: 6000,
+        max_tokens: 8000,
         messages: [{ role: "user", content: prompt }]
       })
     });

@@ -115,14 +115,16 @@ async function getMargin(code) {
     if (rows.length < 2) return null;
     // 取最新有資料的日期（自動回退）
     const latestDate = rows.at(-1).date;
-    console.log(`融資融券最新日期: ${latestDate}, 欄位:`, Object.keys(rows.at(-1)));
+    console.log(`融資融券最新日期: ${latestDate}`);
+    console.log("融資融券完整第一筆:", JSON.stringify(rows.at(-1)));
     const cur  = rows.at(-1);
     const prev = rows.at(-2) || cur;
     // FinMind v4 欄位名稱
-    const marginBal  = parseInt(cur.MarginPurchaseBalance  || cur.margin_purchase_balance  || cur.marginPurchaseBalance  || 0);
-    const marginPrev = parseInt(prev.MarginPurchaseBalance || prev.margin_purchase_balance || prev.marginPurchaseBalance || 0);
-    const shortBal   = parseInt(cur.ShortSaleBalance  || cur.short_sale_balance  || cur.shortSaleBalance  || 0);
-    const shortPrev  = parseInt(prev.ShortSaleBalance || prev.short_sale_balance || prev.shortSaleBalance || 0);
+    // 正確欄位名稱（從 log 確認）
+    const marginBal  = parseInt(cur.MarginPurchaseTodayBalance     || cur.MarginPurchaseYesterdayBalance || 0);
+    const marginPrev = parseInt(cur.MarginPurchaseYesterdayBalance || 0);
+    const shortBal   = parseInt(cur.ShortSaleTodayBalance          || cur.ShortSaleYesterdayBalance     || 0);
+    const shortPrev  = parseInt(cur.ShortSaleYesterdayBalance      || 0);
     return {
       date: cur.date,
       marginBal,

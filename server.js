@@ -72,10 +72,12 @@ async function getChip(code) {
     if (rows.length > 0) console.log("name欄位範例:", [...new Set(rows.slice(0,6).map(r=>r.name))]);
     if (!rows.length) return null;
 
-    // 取最近5個交易日
+    // 取最近有資料的5個交易日（自動回退，不限今日）
     const dates = [...new Set(rows.map(r => r.date))].sort().slice(-5);
     const recent = rows.filter(r => dates.includes(r.date));
-    const latest = rows.filter(r => r.date === dates.at(-1));
+    const latestDate = dates.at(-1);
+    const latest = rows.filter(r => r.date === latestDate);
+    console.log(`三大法人最新日期: ${latestDate}（共${dates.length}個交易日）`);
 
     // 計算買賣超（buy - sell）
     // FinMind name 欄位是英文
@@ -103,21 +105,26 @@ async function getChip(code) {
 async function getMargin(code) {
   try {
     const token = process.env.FINMIND_TOKEN || "";
-    const start = new Date(Date.now() - 10*24*60*60*1000).toISOString().split("T")[0];
+    // 抓30天確保有資料（自動回退到最新公布日）
+    const start = new Date(Date.now() - 30*24*60*60*1000).toISOString().split("T")[0];
     const end = new Date().toISOString().split("T")[0];
     const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMarginPurchaseShortSale&data_id=${code}&start_date=${start}&end_date=${end}&token=${token}`;
     const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
     const data = await r.json();
     const rows = data?.data || [];
     if (rows.length < 2) return null;
-    const cur = rows.at(-1), prev = rows.at(-2);
-    console.log("融資融券欄位:", Object.keys(cur));
-    // FinMind 欄位：MarginPurchaseBalance, ShortSaleBalance
-    const marginBal  = parseInt(cur.MarginPurchaseBalance || cur.margin_purchase_balance || cur.MarginPurchase || 0);
-    const marginPrev = parseInt(prev.MarginPurchaseBalance || prev.margin_purchase_balance || prev.MarginPurchase || 0);
-    const shortBal   = parseInt(cur.ShortSaleBalance || cur.short_sale_balance || cur.ShortSale || 0);
-    const shortPrev  = parseInt(prev.ShortSaleBalance || prev.short_sale_balance || prev.ShortSale || 0);
+    // 取最新有資料的日期（自動回退）
+    const latestDate = rows.at(-1).date;
+    console.log(`融資融券最新日期: ${latestDate}, 欄位:`, Object.keys(rows.at(-1)));
+    const cur  = rows.at(-1);
+    const prev = rows.at(-2) || cur;
+    // FinMind v4 欄位名稱
+    const marginBal  = parseInt(cur.MarginPurchaseBalance  || cur.margin_purchase_balance  || cur.marginPurchaseBalance  || 0);
+    const marginPrev = parseInt(prev.MarginPurchaseBalance || prev.margin_purchase_balance || prev.marginPurchaseBalance || 0);
+    const shortBal   = parseInt(cur.ShortSaleBalance  || cur.short_sale_balance  || cur.shortSaleBalance  || 0);
+    const shortPrev  = parseInt(prev.ShortSaleBalance || prev.short_sale_balance || prev.shortSaleBalance || 0);
     return {
+      date: cur.date,
       marginBal,
       marginChange: marginBal - marginPrev,
       shortBal,
@@ -349,16 +356,16 @@ MACD：${ind.macd||"—"}　Signal：${ind.macdSig||"—"}　柱狀體：${ind.m
 第一支撐：${ind.sup1}　第二支撐：${ind.sup2}　關鍵停損：${ind.stop}
 
 --------------------------------------------------
-【三大法人（FinMind 真實資料）】
-${chip ? `外資近5日：${chip.foreign5>0?"+":""}${chip.foreign5.toLocaleString()} 股　今日：${chip.foreign1>0?"+":""}${chip.foreign1.toLocaleString()} 股
+【三大法人（FinMind 真實資料，最新公布日：${chip?.date||"尚未公布"}）】
+${chip ? `外資近5日：${chip.foreign5>0?"+":""}${chip.foreign5.toLocaleString()} 股　最新日：${chip.foreign1>0?"+":""}${chip.foreign1.toLocaleString()} 股
 投信近5日：${chip.site5>0?"+":""}${chip.site5.toLocaleString()} 股　今日：${chip.site1>0?"+":""}${chip.site1.toLocaleString()} 股
 自營商近5日：${chip.dealer5>0?"+":""}${chip.dealer5.toLocaleString()} 股　今日：${chip.dealer1>0?"+":""}${chip.dealer1.toLocaleString()} 股` : "三大法人資料暫無"}
 
 --------------------------------------------------
-【融資融券（FinMind 真實資料）】
+【融資融券（FinMind 真實資料，最新公布日：${margin?.date||"尚未公布"}）】
 ${margin ? `融資餘額：${margin.marginBal.toLocaleString()} 張　變化：${margin.marginChange>=0?"+":""}${margin.marginChange.toLocaleString()} 張
 融券餘額：${margin.shortBal.toLocaleString()} 張　變化：${margin.shortChange>=0?"+":""}${margin.shortChange.toLocaleString()} 張
-券資比：${margin.marginBal > 0 ? (margin.shortBal/margin.marginBal*100).toFixed(1)+"%" : "—"}` : "融資融券資料暫無"}
+券資比：${margin.marginBal > 0 ? (margin.shortBal/margin.marginBal*100).toFixed(1)+"%" : "—"}` : "融資融券尚未公布，請以前一日資料為參考"}
 
 --------------------------------------------------
 【基本面（FinMind 真實資料）】

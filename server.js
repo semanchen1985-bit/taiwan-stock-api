@@ -336,6 +336,121 @@ function calcIndicators(history, currentPrice) {
 }
 
 // ── 主分析 API ────────────────────────────────────────────
+// ── 熱門股掃描 API ───────────────────────────────────────
+app.get("/scan", async (req, res) => {
+  const mode = req.query.mode || "volume"; // volume | change
+  const limit = Math.min(parseInt(req.query.limit || 20), 30);
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) return res.status(500).json({ error: "API key not configured" });
+
+  try {
+    // 抓 TWSE 即時大盤資料
+    const ts = Date.now();
+    const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw&json=1&delay=0&_=${ts}`;
+    const r = await fetch(url, { headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" } });
+    
+    // 改抓排行榜
+    const rankUrl = mode === "change"
+      ? `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_MI_LISTNO.tw&json=1&delay=0&_=${ts}`
+      : `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_MI_LISTNO.tw&json=1&delay=0&_=${ts}`;
+
+    // 用 TWSE 量排行
+    const volUrl = `https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&type=${mode === "change" ? "MS" : "MV"}&_=${ts}`;
+    const r2 = await fetch(volUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const data2 = await r2.json();
+    
+    let stocks = [];
+    if (data2?.data) {
+      stocks = data2.data.slice(0, limit).map(row => ({
+        code: row[2]?.trim(),
+        name: row[3]?.trim(),
+        price: parseFloat(row[8]?.replace(/,/g,"") || 0),
+        change: row[9]?.trim(),
+        changePct: row[10]?.trim(),
+        volume: parseInt(row[7]?.replace(/,/g,"") || 0),
+      })).filter(s => s.code && s.code.match(/^\d{4}$/));
+    }
+
+    if (!stocks.length) {
+      return res.json({ error: "無法取得排行資料，可能非交易時間" });
+    }
+
+    // 批次抓各股技術指標（只抓近期資料，不用 Claude）
+    const results = await Promise.all(stocks.map(async (stock) => {
+      try {
+        const hist = await getHistory(stock.code);
+        const ind = calcIndicators(hist, stock.price);
+        return {
+          ...stock,
+          direction: ind.direction || "—",
+          bull: ind.bull || 0,
+          bear: ind.bear || 0,
+          rsi: ind.rsi,
+          maTrend: ind.ma_trend || ind.maTrend || "—",
+          macd: ind.macd,
+          macdHist: ind.macdHist,
+          volTrend: ind.volTrend || "—",
+          score: ind.bull || 0,
+        };
+      } catch(e) {
+        return { ...stock, direction: "—", bull: 0, bear: 0, score: 0 };
+      }
+    }));
+
+    // 用 Claude 快速產生一句話結論
+    const prompt = `你是台股職業交易員，根據以下${limit}支熱門股資料，每支給出一句話操作建議（15字內），格式：代號|建議
+
+${
+      results.map(s => 
+        `${s.code} ${s.name}：價${s.price} ${s.changePct} RSI${s.rsi||"—"} ${s.maTrend} ${s.direction}`
+      ).join("
+")
+    }
+
+請逐行輸出，格式：代號|一句話建議`;
+
+    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 1000,
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
+
+    const aiData = await aiRes.json();
+    const aiText = (aiData.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
+    
+    // 解析 AI 建議
+    const suggestions = {};
+    aiText.split("
+").forEach(line => {
+      const parts = line.split("|");
+      if (parts.length >= 2) {
+        const code = parts[0].trim().replace(/\D/g,"").slice(0,4);
+        if (code) suggestions[code] = parts[1].trim();
+      }
+    });
+
+    // 合併結果
+    const final = results.map(s => ({
+      ...s,
+      suggestion: suggestions[s.code] || "觀察中"
+    }));
+
+    res.json({ mode, stocks: final, time: new Date().toISOString() });
+
+  } catch(e) {
+    console.error("scan error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/analyze", async (req, res) => {
   const { code } = req.body;
   if (!code) return res.status(400).json({ error: "Missing code" });

@@ -337,6 +337,20 @@ function calcIndicators(history, currentPrice) {
 
 // ── 主分析 API ────────────────────────────────────────────
 // ── 熱門股掃描 API ───────────────────────────────────────
+// 固定熱門股清單（台股市值前30大 + 常見ETF）
+const SCAN_STOCKS = [
+  {code:"2330",name:"台積電"},{code:"2317",name:"鴻海"},{code:"2454",name:"聯發科"},
+  {code:"2382",name:"廣達"},{code:"2308",name:"台達電"},{code:"2881",name:"富邦金"},
+  {code:"2882",name:"國泰金"},{code:"2886",name:"兆豐金"},{code:"2891",name:"中信金"},
+  {code:"2412",name:"中華電"},{code:"3711",name:"日月光"},{code:"2303",name:"聯電"},
+  {code:"2002",name:"中鋼"},{code:"1301",name:"台塑"},{code:"1303",name:"南亞"},
+  {code:"2207",name:"和泰車"},{code:"2357",name:"華碩"},{code:"2379",name:"瑞昱"},
+  {code:"3008",name:"大立光"},{code:"2395",name:"研華"},{code:"6505",name:"台塑化"},
+  {code:"2603",name:"長榮"},{code:"2615",name:"萬海"},{code:"2609",name:"陽明"},
+  {code:"2408",name:"南亞科"},{code:"3034",name:"聯詠"},{code:"2376",name:"技嘉"},
+  {code:"00878",name:"國泰永續"},{code:"0050",name:"元大台灣50"},{code:"00919",name:"群益高息成長"},
+];
+
 app.get("/scan", async (req, res) => {
   const mode = req.query.mode || "volume";
   const limit = Math.min(parseInt(req.query.limit || 20), 30);
@@ -346,32 +360,41 @@ app.get("/scan", async (req, res) => {
   try {
     const token = process.env.FINMIND_TOKEN || "";
     const today = new Date().toISOString().split("T")[0];
-    // 往前抓7天確保有交易日資料
     const weekAgo = new Date(Date.now()-7*24*60*60*1000).toISOString().split("T")[0];
 
-    // 用 FinMind 抓最近交易日所有股票價格
-    const priceUrl = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&start_date=${weekAgo}&end_date=${today}&token=${token}`;
-    const r = await fetch(priceUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
-    const data = await r.json();
-    const rows = data?.data || [];
+    // 並行抓所有熱門股最新價格
+    const priceList = await Promise.all(
+      SCAN_STOCKS.map(async (s) => {
+        try {
+          const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${s.code}&start_date=${weekAgo}&end_date=${today}&token=${token}`;
+          const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+          const data = await r.json();
+          const rows = data?.data || [];
+          if (!rows.length) return null;
+          const latest = rows.at(-1);
+          const prev = rows.at(-2);
+          const price = parseFloat(latest.close);
+          const prevPrice = prev ? parseFloat(prev.close) : price;
+          const change = price - prevPrice;
+          const changePct = prevPrice ? ((change/prevPrice)*100).toFixed(2) : "0";
+          return {
+            code: s.code,
+            name: s.name,
+            price,
+            change: +change.toFixed(2),
+            changePct: changePct + "%",
+            volume: parseInt(latest.Trading_Volume/1000) || 0,
+          };
+        } catch(e) { return null; }
+      })
+    );
 
-    console.log(`掃描：抓到 ${rows.length} 筆，最新日期：${rows.map(r=>r.date).sort().at(-1)}`);
-    if (!rows.length) {
+    let stocks = priceList.filter(s => s && s.price > 0);
+    console.log(`掃描：成功抓到 ${stocks.length} 支股票`);
+
+    if (!stocks.length) {
       return res.json({ error: "無法取得資料，請稍後再試" });
     }
-
-    // 取最新交易日
-    const latestDate = rows.map(r=>r.date).sort().at(-1);
-    let stocks = rows
-      .filter(r => r.date === latestDate && r.stock_id && r.stock_id.match(/^\d{4}$/) && parseFloat(r.close) > 0)
-      .map(r => ({
-        code: r.stock_id,
-        name: r.stock_id,
-        price: parseFloat(r.close),
-        changePct: r.spread && r.open ? ((parseFloat(r.spread)/parseFloat(r.open))*100).toFixed(2)+"%" : "0%",
-        volume: parseInt(r.Trading_Volume/1000) || 0,
-        spread: parseFloat(r.spread) || 0,
-      }));
 
     // 排序
     if (mode === "change") {
@@ -380,20 +403,6 @@ app.get("/scan", async (req, res) => {
       stocks.sort((a,b) => b.volume - a.volume);
     }
     stocks = stocks.slice(0, limit);
-
-    // 從 FinMind 股票清單補名稱
-    try {
-      const infoUrl = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo&token=${token}`;
-      const ir = await fetch(infoUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
-      const idata = await ir.json();
-      const nameMap = {};
-      (idata?.data||[]).forEach(s => { nameMap[s.stock_id] = s.stock_name; });
-      stocks = stocks.map(s => ({ ...s, name: nameMap[s.code] || s.code }));
-    } catch(e) {}
-
-    if (!stocks.length) {
-      return res.json({ error: "無排行資料，可能非交易時間" });
-    }
 
     // 批次抓各股技術指標（只抓近期資料，不用 Claude）
     const results = await Promise.all(stocks.map(async (stock) => {

@@ -362,10 +362,14 @@ ${chip ? `外資近5日：${chip.foreign5>0?"+":""}${chip.foreign5.toLocaleStrin
 自營商近5日：${chip.dealer5>0?"+":""}${chip.dealer5.toLocaleString()} 股　今日：${chip.dealer1>0?"+":""}${chip.dealer1.toLocaleString()} 股` : "三大法人資料暫無"}
 
 --------------------------------------------------
-【融資融券（FinMind 真實資料，最新公布日：${margin?.date||"尚未公布"}）】
-${margin ? `融資餘額：${margin.marginBal.toLocaleString()} 張　變化：${margin.marginChange>=0?"+":""}${margin.marginChange.toLocaleString()} 張
-融券餘額：${margin.shortBal.toLocaleString()} 張　變化：${margin.shortChange>=0?"+":""}${margin.shortChange.toLocaleString()} 張
-券資比：${margin.marginBal > 0 ? (margin.shortBal/margin.marginBal*100).toFixed(1)+"%" : "—"}` : "融資融券尚未公布，請以前一日資料為參考"}
+【融資融券（FinMind 真實資料）】
+${margin ? `資料日期：${margin.date}
+融資餘額：${margin.marginBal > 0 ? margin.marginBal.toLocaleString()+"張" : "0張（注意：可能是該股無融資資格、或資料尚未更新）"}
+融資變化：${margin.marginChange>=0?"+":""}${margin.marginChange.toLocaleString()} 張
+融券餘額：${margin.shortBal > 0 ? margin.shortBal.toLocaleString()+"張" : "0張（注意：可能是該股無融券資格、或資料尚未更新）"}
+融券變化：${margin.shortChange>=0?"+":""}${margin.shortChange.toLocaleString()} 張
+券資比：${margin.marginBal > 0 ? (margin.shortBal/margin.marginBal*100).toFixed(1)+"%" : "無法計算（融資為0）"}
+⚠ 注意：若融資融券為0，可能原因：1.該股為全額交割股或無法信用交易 2.資料尚未公布（收盤後5~6點才更新）` : "融資融券：查無資料（可能尚未公布或非信用交易股）"}
 
 --------------------------------------------------
 【基本面（FinMind 真實資料）】

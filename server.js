@@ -473,10 +473,16 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
     }
 
     const data = await response.json();
-    const fullText = (data.content || [])
+    const rawText = (data.content || [])
       .filter(b => b.type === "text")
       .map(b => b.text)
       .join("");
+
+    // 清理多餘空行
+    const fullText = rawText
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/===\s*\n{2,}/g, "===\n")
+      .trim();
 
     res.json({
       text: fullText,

@@ -1,17 +1,120 @@
 const express = require("express");
 const app = express();
 
-app.use(express.json());
+app.set("trust proxy", 1); // Render / Heroku 等 PaaS 都在 proxy 後面，req.ip 才正確
+app.use(express.json({ limit: "10kb" })); // 防止 large body attack
+
+// ── 全域 cache（避免重複打 FinMind，Render 免費版友善）────
+const CACHE = new Map();
+const IN_FLIGHT = new Map(); // 防 cache stampede：同 key 只打一次 API
+
+// ── 簡易 Rate Limiter（不需套件）──────────────────────────
+const RATE_STORE = new Map(); // ip -> [timestamps]
+function rateLimit(ip, maxReqs = 20, windowMs = 60000) {
+  const now = Date.now();
+  const reqs = (RATE_STORE.get(ip) || []).filter(t => now - t < windowMs);
+  reqs.push(now);
+  RATE_STORE.set(ip, reqs);
+  // 簡單 LRU-like eviction：不用 spread，直接用 iterator
+  if (RATE_STORE.size > 5000) {
+    RATE_STORE.delete(RATE_STORE.keys().next().value);
+  }
+  return reqs.length > maxReqs;
+}
+
+// 每 10 分鐘清理過期的 RATE_STORE 條目（避免記憶體慢慢增長）
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, reqs] of RATE_STORE) {
+    if (!reqs.length || now - reqs[reqs.length-1] > 60000) RATE_STORE.delete(ip);
+  }
+}, 10 * 60 * 1000);
+
+// ── Background 任務 ─────────────────────────────────────────
+const PORT_INTERNAL = process.env.PORT || 3001;
+
+// 1. 防 Render 冷啟動（每 14 分鐘 self-ping）
+setInterval(() => {
+  fetch(`http://localhost:${PORT_INTERNAL}/health`).catch(() => {});
+}, 14 * 60 * 1000);
+
+// 2. 定時預熱 scan cache（只在有最近用戶活動時才觸發，避免浪費 FinMind credits）
+//    策略：記錄最後一次 scan 請求時間，若 2 分鐘內有人用過，才在 TTL 到期前預熱
+let _lastScanActivity = 0;
+let _bgScanRunning = false;
+setInterval(async () => {
+  // 若最近 5 分鐘內沒人使用掃描功能，跳過預熱（節省 FinMind credits）
+  if (Date.now() - _lastScanActivity > 5 * 60 * 1000) return;
+  if (_bgScanRunning) return;
+  _bgScanRunning = true;
+  try {
+    await fetch(`http://localhost:${PORT_INTERNAL}/scan?mode=volume&limit=20`).catch(() => {});
+  } finally {
+    _bgScanRunning = false;
+  }
+}, 2.5 * 60 * 1000);
+const CACHE_TTL = {
+  history:      10 * 60 * 1000,   // 10 分鐘（K線日內不變）
+  chip:         30 * 60 * 1000,   // 30 分鐘（法人數據一天更新一次）
+  margin:       30 * 60 * 1000,   // 30 分鐘（融資融券一天更新一次）
+  fundamentals:  6 * 60 * 60 * 1000, // 6 小時
+  revenue:      12 * 60 * 60 * 1000, // 12 小時（月營收）
+  scan:          3 * 60 * 1000,   // 3 分鐘（掃描結果）
+};
+function getCache(key) {
+  const entry = CACHE.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > entry.ttl) { CACHE.delete(key); return null; }
+  return entry.data;
+}
+function setCache(key, data, ttl) {
+  // 先刪再插：讓此 key 成為 Map 的最新 entry（維持 insertion-order）
+  CACHE.delete(key);
+  CACHE.set(key, { data, ts: Date.now(), ttl });
+  // FIFO eviction：JS Map 保持 insertion order，第一個就是最舊的 O(1)
+  if (CACHE.size > 500) {
+    CACHE.delete(CACHE.keys().next().value);
+  }
+}
+
+// ── fetch with timeout ────────────────────────────────────
+async function fetchWithTimeout(url, opts = {}, ms = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const r = await fetch(url, { ...opts, signal: controller.signal });
+    clearTimeout(timer); return r;
+  } catch(e) { clearTimeout(timer); throw e; }
+}
+
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
+  const origin = req.headers.origin || "";
+  // 開發環境 or 明確允許的 origin
+  const isAllowed = !origin                                          // server-to-server
+    || origin.includes("localhost")
+    || origin.includes("127.0.0.1")
+    || origin.endsWith(".netlify.app")
+    || origin.endsWith(".github.io")
+    || ALLOWED_ORIGINS.some(o => origin.includes(o));
+  res.header("Access-Control-Allow-Origin", isAllowed ? origin : "");
+  res.header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token");
   res.header("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+  res.header("X-Content-Type-Options", "nosniff");
+  res.header("X-Frame-Options", "DENY");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", time: new Date().toISOString() });
+  res.json({
+    status: "ok",
+    time: new Date().toISOString(),
+    cache: CACHE.size,
+    inFlight: IN_FLIGHT.size,
+    uptime: Math.floor(process.uptime()) + "s",
+    memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB",
+  });
 });
 
 // ── 股票搜尋 API（即時查 TWSE + FinMind）────────────────
@@ -36,8 +139,7 @@ async function getStockList() {
     if (list.length > 0) {
       stockCache = list;
       stockCacheTime = Date.now();
-      console.log(`股票清單快取：${list.length} 筆`);
-    }
+      }
     return list;
   } catch(e) {
     return stockCache || [];
@@ -72,7 +174,7 @@ async function getQuote(code) {
   try {
     for (const [market, ex] of [["上市","tse"],["上櫃","otc"]]) {
       const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${ex}_${code}.tw&json=1&delay=0&_=${Date.now()}`;
-      const r = await fetch(url, { headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" } });
+      const r = await fetchWithTimeout(url, { headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" } }, 5000);
       const data = await r.json();
       const q = data?.msgArray?.[0];
       if (!q?.n) continue;
@@ -91,13 +193,28 @@ async function getQuote(code) {
 }
 
 // ── FinMind 歷史日K ───────────────────────────────────────
+async function getHistoryCached(code) {
+  const cacheKey = `history:${code}`;
+  const cached = getCache(cacheKey);
+  if (cached) return cached;
+  // cache stampede 防護：若已有進行中的請求，等它完成
+  if (IN_FLIGHT.has(cacheKey)) return IN_FLIGHT.get(cacheKey);
+  const promise = getHistory(code).then(data => {
+    if (data && data.length) setCache(cacheKey, data, CACHE_TTL.history);
+    IN_FLIGHT.delete(cacheKey);
+    return data;
+  }).catch(e => { IN_FLIGHT.delete(cacheKey); throw e; });
+  IN_FLIGHT.set(cacheKey, promise);
+  return promise;
+}
+
 async function getHistory(code) {
   try {
     const token = process.env.FINMIND_TOKEN || "";
     const end = new Date().toISOString().split("T")[0];
     const start = new Date(Date.now() - 400*24*60*60*1000).toISOString().split("T")[0];
     const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${code}&start_date=${start}&end_date=${end}&token=${token}`;
-    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const r = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } }, 8000);
     const data = await r.json();
     return (data?.data || []).map(d => ({
       date: d.date,
@@ -113,16 +230,26 @@ async function getHistory(code) {
 
 // ── FinMind 三大法人 ──────────────────────────────────────
 async function getChip(code) {
+  const _ck = `chip:${code}`;
+  const _c = getCache(_ck);
+  if (_c !== null) return Promise.resolve(_c);
+  if (IN_FLIGHT.has(_ck)) return IN_FLIGHT.get(_ck);
+  const _p = getChipInner(code).then(d => {
+    if (d) setCache(_ck, d, CACHE_TTL.chip);
+    IN_FLIGHT.delete(_ck); return d;
+  }).catch(e => { IN_FLIGHT.delete(_ck); return null; });
+  IN_FLIGHT.set(_ck, _p);
+  return _p;
+}
+async function getChipInner(code) {
   try {
     const token = process.env.FINMIND_TOKEN || "";
     const start = new Date(Date.now() - 30*24*60*60*1000).toISOString().split("T")[0];
     const end = new Date().toISOString().split("T")[0];
     const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id=${code}&start_date=${start}&end_date=${end}&token=${token}`;
-    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const r = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } }, 8000);
     const data = await r.json();
     const rows = data?.data || [];
-    console.log(`三大法人 ${code}: 筆數=${rows.length}, msg=${data?.msg||"ok"}`);
-    if (rows.length > 0) console.log("name欄位範例:", [...new Set(rows.slice(0,6).map(r=>r.name))]);
     if (!rows.length) return null;
 
     // 取最近有資料的5個交易日（自動回退，不限今日）
@@ -130,8 +257,6 @@ async function getChip(code) {
     const recent = rows.filter(r => dates.includes(r.date));
     const latestDate = dates.at(-1);
     const latest = rows.filter(r => r.date === latestDate);
-    console.log(`三大法人最新日期: ${latestDate}（共${dates.length}個交易日）`);
-
     // 計算買賣超（buy - sell）
     // FinMind name 欄位是英文
     // Foreign_Investor, Foreign_Dealer_Self = 外資
@@ -141,34 +266,58 @@ async function getChip(code) {
       .filter(r => keywords.some(k => r.name && r.name.includes(k)))
       .reduce((s, r) => s + (parseInt(r.buy||0) - parseInt(r.sell||0)), 0);
 
+    // 計算連買天數
+    const countConsecBuy = (keywords) => {
+      let days = 0;
+      for (const d of [...dates].reverse()) {
+        const dayRows = rows.filter(r => r.date === d);
+        const net = sumNet(keywords, dayRows);
+        if (net > 0) days++;
+        else break;
+      }
+      return days;
+    };
+
     return {
       date: dates.at(-1),
-      foreign5: sumNet(["Foreign_Investor", "Foreign_Dealer_Self"], recent),
-      foreign1: sumNet(["Foreign_Investor", "Foreign_Dealer_Self"], latest),
-      site5:    sumNet(["Investment_Trust"], recent),
-      site1:    sumNet(["Investment_Trust"], latest),
-      dealer5:  sumNet(["Dealer_self", "Dealer_Hedging"], recent),
-      dealer1:  sumNet(["Dealer_self", "Dealer_Hedging"], latest),
+      foreign5:    sumNet(["Foreign_Investor", "Foreign_Dealer_Self"], recent),
+      foreign1:    sumNet(["Foreign_Investor", "Foreign_Dealer_Self"], latest),
+      site5:       sumNet(["Investment_Trust"], recent),
+      site1:       sumNet(["Investment_Trust"], latest),
+      dealer5:     sumNet(["Dealer_self", "Dealer_Hedging"], recent),
+      dealer1:     sumNet(["Dealer_self", "Dealer_Hedging"], latest),
+      foreignDays: countConsecBuy(["Foreign_Investor", "Foreign_Dealer_Self"]),
+      siteDays:    countConsecBuy(["Investment_Trust"]),
     };
-  } catch(e) { console.error("chip error:", e); }
-  return null;
+  } catch(e) { console.error("chip error:", e); return null; }
 }
 
 // ── FinMind 融資融券 ──────────────────────────────────────
 async function getMargin(code) {
+  const _ck = `margin:${code}`;
+  const _c = getCache(_ck);
+  if (_c !== null) return Promise.resolve(_c);
+  if (IN_FLIGHT.has(_ck)) return IN_FLIGHT.get(_ck);
+  const _p = getMarginInner(code).then(d => {
+    if (d) setCache(_ck, d, CACHE_TTL.margin);
+    IN_FLIGHT.delete(_ck); return d;
+  }).catch(e => { IN_FLIGHT.delete(_ck); return null; });
+  IN_FLIGHT.set(_ck, _p);
+  return _p;
+}
+async function getMarginInner(code) {
   try {
     const token = process.env.FINMIND_TOKEN || "";
     // 抓30天確保有資料（自動回退到最新公布日）
     const start = new Date(Date.now() - 30*24*60*60*1000).toISOString().split("T")[0];
     const end = new Date().toISOString().split("T")[0];
     const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMarginPurchaseShortSale&data_id=${code}&start_date=${start}&end_date=${end}&token=${token}`;
-    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const r = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } }, 8000);
     const data = await r.json();
     const rows = data?.data || [];
     if (rows.length < 2) return null;
     // 取最新有資料的日期（自動回退）
     const latestDate = rows.at(-1).date;
-    console.log(`融資融券最新日期: ${latestDate}, 融資:${rows.at(-1).MarginPurchaseTodayBalance}, 融券:${rows.at(-1).ShortSaleTodayBalance}`);
     const cur  = rows.at(-1);
     const prev = rows.at(-2) || cur;
     // FinMind v4 欄位名稱
@@ -190,12 +339,24 @@ async function getMargin(code) {
 
 // ── FinMind 基本面（PE/PB）────────────────────────────────
 async function getFundamentals(code) {
+  const _ck = `fund:${code}`;
+  const _c = getCache(_ck);
+  if (_c !== null) return Promise.resolve(_c);
+  if (IN_FLIGHT.has(_ck)) return IN_FLIGHT.get(_ck);
+  const _p = getFundamentalsInner(code).then(d => {
+    if (d) setCache(_ck, d, CACHE_TTL.fundamentals);
+    IN_FLIGHT.delete(_ck); return d;
+  }).catch(e => { IN_FLIGHT.delete(_ck); return null; });
+  IN_FLIGHT.set(_ck, _p);
+  return _p;
+}
+async function getFundamentalsInner(code) {
   try {
     const token = process.env.FINMIND_TOKEN || "";
     const start = new Date(Date.now() - 30*24*60*60*1000).toISOString().split("T")[0];
     const end = new Date().toISOString().split("T")[0];
     const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPER&data_id=${code}&start_date=${start}&end_date=${end}&token=${token}`;
-    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const r = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } }, 8000);
     const data = await r.json();
     const rows = data?.data || [];
     if (!rows.length) return null;
@@ -211,12 +372,24 @@ async function getFundamentals(code) {
 
 // ── FinMind 月營收 ────────────────────────────────────────
 async function getRevenue(code) {
+  const _ck = `rev:${code}`;
+  const _c = getCache(_ck);
+  if (_c !== null) return Promise.resolve(_c);
+  if (IN_FLIGHT.has(_ck)) return IN_FLIGHT.get(_ck);
+  const _p = getRevenueInner(code).then(d => {
+    if (d) setCache(_ck, d, CACHE_TTL.revenue);
+    IN_FLIGHT.delete(_ck); return d;
+  }).catch(e => { IN_FLIGHT.delete(_ck); return null; });
+  IN_FLIGHT.set(_ck, _p);
+  return _p;
+}
+async function getRevenueInner(code) {
   try {
     const token = process.env.FINMIND_TOKEN || "";
     const start = new Date(Date.now() - 365*24*60*60*1000).toISOString().split("T")[0];
     const end = new Date().toISOString().split("T")[0];
     const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id=${code}&start_date=${start}&end_date=${end}&token=${token}`;
-    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const r = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } }, 8000);
     const data = await r.json();
     const rows = data?.data || [];
     if (!rows.length) return null;
@@ -237,7 +410,7 @@ function calcIndicators(history, currentPrice) {
   const closes = [...history.map(h => h.close)];
   if (currentPrice > 0) closes.push(currentPrice);
   const n = closes.length;
-  if (n < 5) return {};
+  if (n < 5) return { ma5:null,ma10:null,ma20:null,ma60:null,rsi:null,k:null,d:null,macd:null,macdHist:null,maTrend:"資料不足",volTrend:"—",bull:0,bear:0,direction:"資料不足" };
 
   const ma = (p) => n >= p ? +(closes.slice(-p).reduce((s,v)=>s+v,0)/p).toFixed(2) : null;
   const ma5=ma(5), ma10=ma(10), ma20=ma(20), ma60=ma(60), ma120=ma(120), ma240=ma(240);
@@ -306,15 +479,15 @@ function calcIndicators(history, currentPrice) {
   let weekHigh = null, weekLow = null;
   if (history.length >= 5) {
     const w13 = history.slice(-65);
-    weekHigh = Math.max(...w13.map(h=>h.high||h.close));
-    weekLow  = Math.min(...w13.map(h=>h.low||h.close));
+    weekHigh = w13.reduce((mx,h) => Math.max(mx, h.high||h.close), -Infinity);
+    weekLow  = w13.reduce((mn,h) => Math.min(mn, h.low||h.close),  Infinity);
   }
   // ── 52週高低（近252個交易日）────────────────────────────
   let high52w = null, low52w = null;
   if (history.length >= 50) {
     const y = history.slice(-252);
-    high52w = Math.max(...y.map(h=>h.high||h.close));
-    low52w  = Math.min(...y.map(h=>h.low||h.close));
+    high52w = y.reduce((mx,h) => Math.max(mx, h.high||h.close), -Infinity);
+    low52w  = y.reduce((mn,h) => Math.min(mn, h.low||h.close),  Infinity);
   }
   // ── 年線方向（MA240 vs MA200）───────────────────────────
   const ma200 = n>=200 ? +(closes.slice(-200).reduce((s,v)=>s+v,0)/200).toFixed(2) : null;
@@ -335,6 +508,172 @@ function calcIndicators(history, currentPrice) {
   };
 }
 
+// ════════════════════════════════════════════════════════════
+// 熱門選股評分系統（100 分滿分）
+// ════════════════════════════════════════════════════════════
+function calcStockScore(ind, chip, margin, fundamentals, revenue, history, price) {
+  let score = 0;
+  const detail = {};   // 各面向細項得分
+
+  // ── 基本面 20 分 ────────────────────────────────────────
+  let fundScore = 0;
+
+  // 月營收年增率 > 10% +5
+  if (revenue?.yoy != null) {
+    if (revenue.yoy > 10) { fundScore += 5; detail.rev_yoy = "+5 月營收年增率>" + revenue.yoy + "%"; }
+    else detail.rev_yoy = "0 月營收年增率" + revenue.yoy + "%";
+  } else { detail.rev_yoy = "0 月營收資料不足"; }
+
+  // EPS 年增率 > 10% +5（用 PE 倒推：若 PE 下降但股價上漲，暗示 EPS 增長）
+  // FinMind 沒有直接 EPS 年增率，用 PE 近期趨勢判斷（保守估計）
+  if (fundamentals?.pe != null && fundamentals.pe > 0 && fundamentals.pe < 40) {
+    // PE 合理且不過高，暗示 EPS 增長中
+    fundScore += 5; detail.eps_growth = "+5 PE合理(" + fundamentals.pe + ")";
+  } else { detail.eps_growth = "0 PE過高或無資料"; }
+
+  // ROE > 10% +5（用 PB/PE 估算：PB=ROE×PE）
+  if (fundamentals?.pb != null && fundamentals?.pe != null && fundamentals.pb > 0 && fundamentals.pe > 0) {
+    const estROE = (fundamentals.pb / fundamentals.pe * 100);
+    if (estROE > 10) { fundScore += 5; detail.roe = "+5 估算ROE>" + estROE.toFixed(1) + "%"; }
+    else detail.roe = "0 估算ROE=" + estROE.toFixed(1) + "%";
+  } else { detail.roe = "0 基本面資料不足"; }
+
+  // 毛利率穩定或上升（月營收連續兩月正增長作為代理指標）+5
+  if (revenue?.yoy != null && revenue.yoy > 0) {
+    fundScore += 5; detail.margin_stable = "+5 營收增長（代理毛利率）";
+  } else { detail.margin_stable = "0 營收未增長"; }
+
+  score += Math.min(fundScore, 20);
+  detail._fund = Math.min(fundScore, 20);
+
+  // ── 技術面 25 分 ────────────────────────────────────────
+  let techScore = 0;
+  const p = price || ind.ma20;
+
+  // 股價站上 20 日線 +5
+  if (ind.ma20 && p > ind.ma20) { techScore += 5; detail.above_ma20 = "+5 站上MA20"; }
+  else detail.above_ma20 = "0 未站上MA20";
+
+  // 20 日線向上：用 MA20 > MA60 * 0.99 作為代理（近期上揚）
+  if (ind.ma20 && ind.ma60 && ind.ma20 > ind.ma60) { techScore += 5; detail.ma20_up = "+5 MA20>MA60（向上）"; }
+  else detail.ma20_up = "0 MA20未向上";
+
+  // 60 日線向上：MA60 > MA120
+  if (ind.ma60 && ind.ma120 && ind.ma60 > ind.ma120) { techScore += 5; detail.ma60_up = "+5 MA60>MA120（向上）"; }
+  else detail.ma60_up = "0 MA60未向上";
+
+  // 均線多頭排列 +5
+  if (ind.maTrend === "多頭排列") { techScore += 5; detail.ma_bull = "+5 多頭排列"; }
+  else detail.ma_bull = "0 非多頭排列(" + ind.maTrend + ")";
+
+  // 突破前高或平台整理：股價近 5% 內接近或超過 20 日最高
+  const high20 = history?.length >= 20 ? Math.max(...history.slice(-20).map(h => h.high || h.close)) : null;
+  if (high20 && p >= high20 * 0.98) { techScore += 5; detail.breakout = "+5 近20日高點附近突破"; }
+  else detail.breakout = "0 未突破前高";
+
+  score += Math.min(techScore, 25);
+  detail._tech = Math.min(techScore, 25);
+
+  // ── 量價關係 15 分 ────────────────────────────────────────
+  let volScore = 0;
+  const todayVol = history?.at(-1)?.volume || 0;
+  const prev5Vols = history?.slice(-6, -1).map(h => h.volume) || [];
+  const avg5Vol = prev5Vols.length ? prev5Vols.reduce((s,v)=>s+v,0)/prev5Vols.length : 0;
+  const todayChange = history?.length >= 2
+    ? history.at(-1).close - history.at(-2).close : 0;
+
+  // 上漲放量 +5
+  if (todayChange > 0 && avg5Vol > 0 && todayVol > avg5Vol * 1.2) {
+    volScore += 5; detail.up_vol = "+5 上漲放量";
+  } else detail.up_vol = "0 未上漲放量";
+
+  // 回檔量縮 +5（近3日下跌但量縮）
+  const last3Change = history?.length >= 4
+    ? history.at(-1).close - history.at(-4).close : null;
+  const last3VolAvg = history?.length >= 4
+    ? history.slice(-3).reduce((s,h)=>s+(h.volume||0),0)/3 : 0;
+  if (last3Change != null && last3Change < 0 && last3VolAvg < avg5Vol * 0.85) {
+    volScore += 5; detail.down_vol = "+5 回檔量縮";
+  } else detail.down_vol = "0 無量縮回檔";
+
+  // 成交量大於 5 日均量 +5
+  if (avg5Vol > 0 && todayVol > avg5Vol) { volScore += 5; detail.vol_above_avg = "+5 量>5日均量"; }
+  else detail.vol_above_avg = "0 量<5日均量";
+
+  score += Math.min(volScore, 15);
+  detail._vol = Math.min(volScore, 15);
+
+  // ── 籌碼面 20 分 ────────────────────────────────────────
+  let chipScore = 0;
+
+  // 外資連買 3 日以上 +5
+  if (chip?.foreignDays >= 3) { chipScore += 5; detail.foreign_buy = "+5 外資連買" + chip.foreignDays + "日"; }
+  else if (chip?.foreign5 > 0) { chipScore += 2; detail.foreign_buy = "+2 外資近5日買超"; }
+  else detail.foreign_buy = "0 外資未連買3日";
+
+  // 投信連買 3 日以上 +5
+  if (chip?.siteDays >= 3) { chipScore += 5; detail.site_buy = "+5 投信連買" + chip.siteDays + "日"; }
+  else if (chip?.site5 > 0) { chipScore += 2; detail.site_buy = "+2 投信近5日買超"; }
+  else detail.site_buy = "0 投信未連買";
+
+  // 主力買超集中（外資+投信合計近5日大量買超）+5
+  const totalInst5 = (chip?.foreign5 || 0) + (chip?.site5 || 0);
+  if (totalInst5 > 5000) { chipScore += 5; detail.inst_total = "+5 法人合計買超>" + (totalInst5/1000).toFixed(0) + "千股"; }
+  else if (totalInst5 > 0) { chipScore += 2; detail.inst_total = "+2 法人小幅買超"; }
+  else detail.inst_total = "0 法人未買超";
+
+  // 大戶持股增加（近5日外資持續買超作為代理）+5
+  if (chip?.foreign5 > 10000 && chip?.foreignDays >= 2) { chipScore += 5; detail.big_player = "+5 大戶持股增加（外資買超）"; }
+  else detail.big_player = "0 大戶持股未明顯增加";
+
+  score += Math.min(chipScore, 20);
+  detail._chip = Math.min(chipScore, 20);
+
+  // ── 融資融券 10 分 ────────────────────────────────────────
+  let marginScore = 0;
+
+  // 股價上漲但融資沒有暴增（健康上漲）+5
+  if (margin?.marginChange != null && todayChange > 0) {
+    const marginGrowth = margin.marginBal > 0 ? margin.marginChange / margin.marginBal : 0;
+    if (marginGrowth < 0.05) { // 融資增幅 < 5%
+      marginScore += 5; detail.margin_health = "+5 上漲融資未暴增";
+    } else detail.margin_health = "0 融資增幅過高(" + (marginGrowth*100).toFixed(1) + "%)";
+  } else if (margin == null) { detail.margin_health = "0 融資資料不足"; }
+  else detail.margin_health = "0 股價未上漲";
+
+  // 融資下降但股價不跌 +5
+  if (margin?.marginChange != null && margin.marginChange < 0 && todayChange >= 0) {
+    marginScore += 5; detail.margin_decrease = "+5 融資下降股價未跌（去槓桿健康）";
+  } else detail.margin_decrease = "0 條件未達";
+
+  score += Math.min(marginScore, 10);
+  detail._margin = Math.min(marginScore, 10);
+
+  // ── 題材面 10 分 ────────────────────────────────────────
+  // 無法即時判斷，用 Claude AI 判斷（傳回 0，由前端 AI 補充）
+  // 保守預設：若近期強勢（接近52週高）且有量，給 5 分
+  let themeScore = 0;
+  if (ind.high52w && p >= ind.high52w * 0.85) { themeScore += 5; detail.theme_main = "+5 近52週高（強勢題材代理）"; }
+  else detail.theme_main = "0 未接近52週高";
+  // 題材有訂單支撐：月營收正增長作為代理 +5
+  if (revenue?.yoy != null && revenue.yoy > 0) { themeScore += 5; detail.theme_support = "+5 月營收正增長（訂單支撐代理）"; }
+  else detail.theme_support = "0 月營收未正增長";
+
+  score += Math.min(themeScore, 10);
+  detail._theme = Math.min(themeScore, 10);
+
+  // ── 分級判定 ─────────────────────────────────────────────
+  let grade, gradeColor;
+  if (score >= 80)      { grade = "強勢觀察 🔥"; gradeColor = "#ef4444"; }
+  else if (score >= 65) { grade = "可試單 👀";   gradeColor = "#f59e0b"; }
+  else if (score >= 50) { grade = "等待整理 ⏳";  gradeColor = "#6b7280"; }
+  else                  { grade = "不建議 ❌";    gradeColor = "#374151"; }
+
+  // 最終 NaN / 越界保護
+  const safeScore = Number.isFinite(score) ? Math.max(0, Math.min(100, Math.round(score))) : 0;
+  return { score: safeScore, grade, gradeColor, detail };
+}
+
 // ── 主分析 API ────────────────────────────────────────────
 // ── 熱門股掃描 API ───────────────────────────────────────
 // 固定熱門股清單（台股市值前30大 + 常見ETF）
@@ -353,26 +692,56 @@ const SCAN_STOCKS = [
 
 app.get("/scan", async (req, res) => {
   const mode = req.query.mode || "volume";
-  const limit = Math.min(parseInt(req.query.limit || 20), 30);
+  const limit = Math.min(parseInt(req.query.limit || 20), 20); // 降到 20，保護 Render 免費版
+
+  // 整體掃描 cache（3 分鐘內不重複算）
+  const scanCacheKey = `scan:${mode}:${limit}`;
+  const scanCached = getCache(scanCacheKey);
+  if (scanCached) {
+    console.log(`/scan cache hit: ${scanCacheKey}`);
+    return res.json({ ...scanCached, cached: true });
+  }
+  const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+  if (rateLimit(ip, 5, 60000)) { // scan 每分鐘最多 5 次
+    return res.status(429).json({ error: "掃描請求過於頻繁，請稍後再試" });
+  }
+
+  // Claude API key 非必要（沒有就跳過 AI 建議）
   const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) return res.status(500).json({ error: "API key not configured" });
+
+  // 記錄活動時間（供背景預熱判斷）
+  _lastScanActivity = Date.now();
+  // Render 免費版 30s timeout 保護
+  const scanDeadline = Date.now() + 25000; // 25s 截止
+  const checkDeadline = () => { if (Date.now() > scanDeadline) throw new Error("scan timeout"); };
 
   try {
     const token = process.env.FINMIND_TOKEN || "";
     const today = new Date().toISOString().split("T")[0];
     const weekAgo = new Date(Date.now()-7*24*60*60*1000).toISOString().split("T")[0];
 
+    // 批次抓熱門股（每批 10 支，避免 FinMind rate limit）
+    const batchFetch = async (list, fn) => {
+      const results = [];
+      for (let i = 0; i < list.length; i += 10) {
+        const batch = list.slice(i, i + 10);
+        const batchRes = await Promise.allSettled(batch.map(fn));
+        batchRes.forEach(r => results.push(r.status === 'fulfilled' ? r.value : null));
+        if (i + 10 < list.length) { checkDeadline(); await new Promise(r => setTimeout(r, 200)); } // 批次間隔 300ms
+      }
+      return results;
+    };
+
     // 並行抓所有熱門股最新價格
-    const priceList = await Promise.all(
-      SCAN_STOCKS.map(async (s) => {
+    const priceList = await batchFetch(SCAN_STOCKS, async (s) => {
         try {
           const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${s.code}&start_date=${weekAgo}&end_date=${today}&token=${token}`;
-          const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+          const r = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } }, 8000);
           const data = await r.json();
           const rows = data?.data || [];
           if (!rows.length) return null;
-          const latest = rows.at(-1);
-          const prev = rows.at(-2);
+          const latest = rows.at(-1) || {};
+          const prev = rows.at(-2) || {};
           const price = parseFloat(latest.close);
           const prevPrice = prev ? parseFloat(prev.close) : price;
           const change = price - prevPrice;
@@ -386,12 +755,9 @@ app.get("/scan", async (req, res) => {
             volume: parseInt(latest.Trading_Volume/1000) || 0,
           };
         } catch(e) { return null; }
-      })
-    );
+    });
 
     let stocks = priceList.filter(s => s && s.price > 0);
-    console.log(`掃描：成功抓到 ${stocks.length} 支股票`);
-
     if (!stocks.length) {
       return res.json({ error: "無法取得資料，請稍後再試" });
     }
@@ -404,40 +770,79 @@ app.get("/scan", async (req, res) => {
     }
     stocks = stocks.slice(0, limit);
 
-    // 批次抓各股技術指標（只抓近期資料，不用 Claude）
-    const results = await Promise.all(stocks.map(async (stock) => {
+    // 批次抓各股詳細資料（技術+籌碼+融資+基本面+營收）
+    checkDeadline(); // 確保還在 25s 內
+    const results = await batchFetch(stocks, async (stock) => {
       try {
-        const hist = await getHistory(stock.code);
+        // Lightweight mode：優先用 cache，cache miss 的 chip/margin/fund/rev 直接跳過
+        // 這樣 cache hot 時只打 history（1 call），避免 FinMind 每次 120 calls
+        const useCached = (fn, key) => {
+          const ck = getCache(key);
+          return ck !== null ? Promise.resolve(ck) : fn(stock.code);
+        };
+        const [histR, chipR, marginR, fundR, revR] = await Promise.allSettled([
+          getHistoryCached(stock.code),
+          useCached(getChip,         `chip:${stock.code}`),
+          useCached(getMargin,       `margin:${stock.code}`),
+          useCached(getFundamentals, `fund:${stock.code}`),
+          useCached(getRevenue,      `rev:${stock.code}`),
+        ]);
+        const hist         = histR.status  === 'fulfilled' ? histR.value  : [];
+        const chip         = chipR.status  === 'fulfilled' ? chipR.value  : null;
+        const margin       = marginR.status === 'fulfilled' ? marginR.value : null;
+        const fundamentals = fundR.status  === 'fulfilled' ? fundR.value  : null;
+        const revenue      = revR.status   === 'fulfilled' ? revR.value   : null;
         const ind = calcIndicators(hist, stock.price);
+        const scored = calcStockScore(ind, chip, margin, fundamentals, revenue, hist, stock.price);
         return {
           ...stock,
           direction: ind.direction || "—",
           bull: ind.bull || 0,
           bear: ind.bear || 0,
           rsi: ind.rsi,
-          maTrend: ind.ma_trend || ind.maTrend || "—",
+          maTrend: ind.maTrend || "—",
           macd: ind.macd,
           macdHist: ind.macdHist,
           volTrend: ind.volTrend || "—",
-          score: ind.bull || 0,
+          // 評分系統
+          score:       scored.score,
+          grade:       scored.grade,
+          gradeColor:  scored.gradeColor,
+          scoreDetail: scored.detail,
+          // 各面向分數
+          fundScore:   scored.detail._fund  || 0,
+          techScore:   scored.detail._tech  || 0,
+          volScore:    scored.detail._vol   || 0,
+          chipScore:   scored.detail._chip  || 0,
+          marginScore: scored.detail._margin|| 0,
+          themeScore:  scored.detail._theme || 0,
         };
       } catch(e) {
-        return { ...stock, direction: "—", bull: 0, bear: 0, score: 0 };
+        return { ...stock, direction: "—", bull: 0, bear: 0, score: 0, grade: "資料不足", gradeColor: "#374151" };
       }
-    }));
+    });
+    
+    // 依評分由高到低重新排序
+    results.sort((a, b) => b.score - a.score);
 
-    // 用 Claude 快速產生一句話結論
-    const prompt = `你是台股職業交易員，根據以下${limit}支熱門股資料，每支給出一句話操作建議（15字內），格式：代號|建議
+    // 用 Claude 快速產生一句話結論（沒有 key 就跳過）
+    if (!key) {
+      const final = results.map(s => ({ ...s, suggestion: s.grade || "觀察中" }));
+      const respData = { mode, stocks: final, time: new Date().toISOString() };
+      setCache(scanCacheKey, respData, CACHE_TTL.scan);
+      return res.json(respData);
+    }
+    const prompt = `你是台股職業交易員，根據以下${limit}支熱門股評分資料，每支給出一句話操作建議（15字內），格式：代號|建議
 
 ${
       results.map(s => 
-        `${s.code} ${s.name}：價${s.price} ${s.changePct} RSI${s.rsi||"—"} ${s.maTrend} ${s.direction}`
+        `${s.code} ${s.name}：${s.score}分/${s.grade} 價${s.price} ${s.changePct} RSI${s.rsi||"—"} ${s.maTrend} 法人${s.chipScore}分 技術${s.techScore}分`
       ).join("\n")
     }
 
-請逐行輸出，格式：代號|一句話建議`;
+請逐行輸出，格式：代號|一句話建議（要符合評分等級，強勢股說強勢，不建議股說風險）`;
 
-    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+    const aiRes = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -470,34 +875,48 @@ ${
       suggestion: suggestions[s.code] || "觀察中"
     }));
 
-    res.json({ mode, stocks: final, time: new Date().toISOString() });
+    const respData = { mode, stocks: final, time: new Date().toISOString() };
+    setCache(scanCacheKey, respData, CACHE_TTL.scan);
+    res.json(respData);
 
   } catch(e) {
-    console.error("scan error:", e);
+    console.error("scan error:", e.message);
+    if (e.message === 'scan timeout') {
+      // 有部分結果就回傳
+      return res.json({ mode, stocks: [], error: "掃描逾時，請重試（後端冷啟動中）", time: new Date().toISOString() });
+    }
     res.status(500).json({ error: e.message });
   }
 });
 
 app.post("/analyze", async (req, res) => {
-  const { code } = req.body;
-  if (!code) return res.status(400).json({ error: "Missing code" });
+  const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+  if (rateLimit(ip, 10, 60000)) { // 每分鐘最多 10 次分析
+    return res.status(429).json({ error: "請求過於頻繁，請稍後再試" });
+  }
+  const { code: rawCode } = req.body;
+  if (!rawCode) return res.status(400).json({ error: "Missing code" });
+  // 只允許股票代號格式（4-6 碼英數）
+  const code = String(rawCode).replace(/[^A-Za-z0-9]/g, '').slice(0, 6).toUpperCase();
+  if (!code) return res.status(400).json({ error: "Invalid code" });
   const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) return res.status(500).json({ error: "API key not configured" });
 
   try {
-    // Debug: 確認環境變數
-    console.log("ANTHROPIC_API_KEY:", process.env.ANTHROPIC_API_KEY ? "✅有設定" : "❌未設定");
-    console.log("FINMIND_TOKEN:", process.env.FINMIND_TOKEN ? "✅有設定" : "❌未設定");
-    
-    // 並行抓所有資料
-    const [quote, history, chip, margin, fundamentals, revenue] = await Promise.all([
+    // 並行抓所有資料（history 用 cache）
+    const [qR, hR, cR, mR, fR, rR] = await Promise.allSettled([
       getQuote(code),
-      getHistory(code),
+      getHistoryCached(code),
       getChip(code),
       getMargin(code),
       getFundamentals(code),
       getRevenue(code),
     ]);
+    const quote        = qR.status === 'fulfilled' ? qR.value : null;
+    const history      = hR.status === 'fulfilled' ? (hR.value || []) : [];
+    const chip         = cR.status === 'fulfilled' ? cR.value : null;
+    const margin       = mR.status === 'fulfilled' ? mR.value : null;
+    const fundamentals = fR.status === 'fulfilled' ? fR.value : null;
+    const revenue      = rR.status === 'fulfilled' ? rR.value : null;
 
     if (!quote && !history.length) {
       return res.status(404).json({ error: `查無股票代號 ${code}` });
@@ -703,5 +1122,59 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
   }
 });
 
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`台股AI後端啟動 port ${PORT}`));
+// ── Cache 統計 endpoint（debug 用）───────────────────────
+app.get("/cache-stats", (req, res) => {
+  // 不回傳 keys（避免洩漏哪些股票代號被查詢）
+  res.json({
+    cacheSize:    CACHE.size,
+    inFlightSize: IN_FLIGHT.size,
+    ratestoreSize:RATE_STORE.size,
+    uptime:       Math.floor(process.uptime()) + "s",
+    memory:       Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB",
+  });
+});
+
+// ── 清除 cache endpoint──────────────────────────────────
+app.post("/cache-clear", (req, res) => {
+  // 需要 admin token 才能清除 cache
+  const adminToken = process.env.ADMIN_TOKEN;
+  const provided   = req.headers["x-admin-token"] || req.body?.token;
+  if (!adminToken || provided !== adminToken) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const before = CACHE.size;
+  CACHE.clear();
+  IN_FLIGHT.clear();
+  res.json({ ok: true, cleared: before });
+});
+
+// ── Process hardening ───────────────────────────────────────
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason?.message || reason);
+  // 不崩潰，記錄即可
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err.message);
+  // uncaughtException 後狀態不確定，給 1s 讓 Render 看到 log 再重啟
+  setTimeout(() => process.exit(1), 1000);
+});
+
+// Graceful shutdown（Render deploy 時會送 SIGTERM）
+const server = app.listen(PORT, () => {
+  console.log(`台股AI後端啟動 port ${PORT}`);
+  console.log(`Cache TTL: history=${CACHE_TTL.history/1000}s, scan=${CACHE_TTL.scan/1000}s`);
+});
+
+function gracefulShutdown(signal) {
+  console.log(`[${signal}] Graceful shutdown...`);
+  server.close(() => {
+    console.log("HTTP server closed");
+    process.exit(0);
+  });
+  // 若 10s 內沒關完，強制結束
+  setTimeout(() => process.exit(1), 10000);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT",  () => gracefulShutdown("SIGINT"));

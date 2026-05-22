@@ -275,13 +275,12 @@ async function getQuote(code) {
 }
 
 
-async function getHistoryCached(code) {
-  const cacheKey = `history:${code}`;
+async function getHistoryCached(code, days = 400) {
+  const cacheKey = `history:${code}:${days}`;
   const cached = getCache(cacheKey);
   if (cached) return cached;
-  // cache stampede 防護：若已有進行中的請求，等它完成
   if (IN_FLIGHT.has(cacheKey)) return IN_FLIGHT.get(cacheKey);
-  const promise = getHistory(code).then(data => {
+  const promise = getHistory(code, days).then(data => {
     if (data && data.length) setCache(cacheKey, data, CACHE_TTL.history);
     IN_FLIGHT.delete(cacheKey);
     return data;
@@ -290,11 +289,11 @@ async function getHistoryCached(code) {
   return promise;
 }
 
-async function getHistory(code) {
+async function getHistory(code, days = 400) {
   try {
     const token = process.env.FINMIND_TOKEN || "";
     const end = new Date().toISOString().split("T")[0];
-    const start = new Date(Date.now() - 400*24*60*60*1000).toISOString().split("T")[0];
+    const start = new Date(Date.now() - days*24*60*60*1000).toISOString().split("T")[0];
     const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${code}&start_date=${start}&end_date=${end}&token=${token}`;
     const r = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } }, 8000);
     const data = await r.json();
@@ -971,7 +970,7 @@ app.get("/scan", async (req, res) => {
           return ck !== null ? Promise.resolve(ck) : Promise.resolve(null);
         };
         const [histR, chipR, marginR, fundR, revR] = await Promise.allSettled([
-          getHistoryCached(stock.code),
+          getHistoryCached(stock.code, 120), // scan 只需 120 天，夠算 MA60/RSI
           skipIfNoCached(`chip:${stock.code}`),
           skipIfNoCached(`margin:${stock.code}`),
           skipIfNoCached(`fund:${stock.code}`),

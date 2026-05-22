@@ -1,14 +1,15 @@
 {
-  "name": "taiwan-stock-backend",
+  "name": "taiwan-stock-api",
   "version": "1.0.0",
+  "description": "台股AI分析後端",
   "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2"
-  },
-  "engines": {
-    "node": ">=18"
   }
 }

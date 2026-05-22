@@ -1040,7 +1040,8 @@ app.get("/scan", async (req, res) => {
         if (!hist.length) return null;
         // 從 meta 取即時股價
         const price   = meta.regularMarketPrice || hist.at(-1)?.close || 0;
-        const prev    = meta.previousClose || meta.chartPreviousClose || hist.at(-2)?.close || price;
+        // 用 K 線倒數第二筆作前日收盤，避免 meta.previousClose 取到遠期資料
+        const prev    = hist.at(-2)?.close || meta.chartPreviousClose || meta.previousClose || price;
         const change  = +(price - prev).toFixed(2);
         const changePct = prev > 0 ? ((change/prev)*100).toFixed(2) : "0";
         const s = SCAN_STOCKS.find(s => s.code === code);
@@ -1439,6 +1440,9 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
       .replace(/\n{3,}/g, "\n\n")
       .trim();
 
+    // 計算評分（和掃描一樣的邏輯）
+    const scored = calcStockScore(ind, chip, margin, fundamentals, revenue, history, price);
+
     res.json({
       text: fullText,
       quote: q,
@@ -1447,6 +1451,7 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
       margin,
       fundamentals,
       revenue,
+      scored,  // 評分結果
     });
 
   } catch(e) {

@@ -109,7 +109,7 @@ app.use((req, res, next) => {
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    version: "2025-v5-chart",   // ← 確認版本用
+    version: "2025-v6-spark",   // ← 確認版本用
     time: new Date().toISOString(),
     cache: CACHE.size,
     inFlight: IN_FLIGHT.size,
@@ -172,6 +172,18 @@ app.get("/test-apis", async (req, res) => {
     const rows = d?.data || [];
     results.finmind = rows.length ? `✅ 三大法人 ${rows.length} 筆，token=${token?"有":"無"}` : `⚠ 無資料 msg=${d?.msg||""} token=${token?"有":"無"}`;
   } catch(e) { results.finmind = "❌ " + e.message; }
+
+  // 5. Yahoo spark batch（scan 用）
+  try {
+    const r = await fetchWithTimeout(
+      "https://query1.finance.yahoo.com/v7/finance/spark?symbols=2330.TW,2317.TW&range=1mo&interval=1d",
+      { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json" } },
+      8000
+    );
+    const d = await r.json();
+    const items = d?.spark?.result || [];
+    results.yahooSpark = items.length ? `✅ ${items.length} 支，${items[0]?.response?.[0]?.timestamp?.length || 0} 筆K線` : "⚠ 無資料";
+  } catch(e) { results.yahooSpark = "❌ " + e.message; }
 
   res.json({ time: new Date().toISOString(), apis: results });
 });
@@ -1030,30 +1042,69 @@ app.get("/scan", async (req, res) => {
     }
     stocks = stocks.slice(0, limit);
 
-    // 批次抓各股詳細資料（技術+籌碼+融資+基本面+營收）
-    checkDeadline(); // 確保還在 25s 內
-    const results = await batchFetch(stocks, async (stock) => {
+    // ── 一次抓所有股票 K 線（Yahoo spark batch）────────────
+    checkDeadline();
+    const stockCodes = stocks.map(s => s.code);
+    const sparkSymbols = stockCodes.map(c => c + ".TW").join(",");
+    let sparkMap = new Map(); // code → history[]
+
+    try {
+      const sparkUrl = `https://query1.finance.yahoo.com/v7/finance/spark?symbols=${encodeURIComponent(sparkSymbols)}&range=6mo&interval=1d`;
+      const sparkRes = await fetchWithTimeout(sparkUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Accept": "application/json",
+        }
+      }, 12000);
+      const sparkData = await sparkRes.json();
+      const sparkResult = sparkData?.spark?.result || [];
+      sparkResult.forEach(item => {
+        const code = (item.symbol || "").replace(".TW", "");
+        const resp = item.response?.[0];
+        if (!resp) return;
+        const timestamps = resp.timestamp || [];
+        const q = resp.indicators?.quote?.[0] || {};
+        const closes  = q.close  || [];
+        const opens   = q.open   || [];
+        const highs   = q.high   || [];
+        const lows    = q.low    || [];
+        const volumes = q.volume || [];
+        const hist = timestamps.map((ts, i) => ({
+          date:   new Date(ts * 1000).toISOString().split("T")[0],
+          open:   +(opens[i]  || closes[i] || 0).toFixed(2),
+          high:   +(highs[i]  || closes[i] || 0).toFixed(2),
+          low:    +(lows[i]   || closes[i] || 0).toFixed(2),
+          close:  +(closes[i] || 0).toFixed(2),
+          volume: Math.round((volumes[i] || 0) / 1000),
+        })).filter(d => d.close > 0);
+        if (hist.length > 0) sparkMap.set(code, hist);
+      });
+      console.log(`[scan] spark: ${sparkMap.size}/${stockCodes.length} stocks`);
+    } catch(e) {
+      console.error("[scan] spark error:", e.message);
+    }
+
+    // spark 沒抓到的，從 cache 或逐支補抓（最多 5 支，避免逾時）
+    const missingHist = stocks.filter(s => !sparkMap.has(s.code)).slice(0, 5);
+    for (const s of missingHist) {
+      const cached = getCache(`history:${s.code}:120`);
+      if (cached) { sparkMap.set(s.code, cached); continue; }
       try {
-        // Scan lightweight mode：
-        // - history 永遠抓（技術面需要）
-        // - chip/margin/fund/rev：cache 有就用，cache miss 就 skip（不打 API）
-        //   避免 20 支股票 × 4 API = 80 calls 超過 FinMind rate limit 或 25s deadline
-        const skipIfNoCached = (key) => {
-          const ck = getCache(key);
-          return ck !== null ? Promise.resolve(ck) : Promise.resolve(null);
-        };
-        const [histR, chipR, marginR, fundR, revR] = await Promise.allSettled([
-          getHistoryCached(stock.code, 120), // scan 只需 120 天，夠算 MA60/RSI
-          skipIfNoCached(`chip:${stock.code}`),
-          skipIfNoCached(`margin:${stock.code}`),
-          skipIfNoCached(`fund:${stock.code}`),
-          skipIfNoCached(`rev:${stock.code}`),
-        ]);
-        const hist         = histR.status  === 'fulfilled' ? histR.value  : [];
-        const chip         = chipR.status  === 'fulfilled' ? chipR.value  : null;
-        const margin       = marginR.status === 'fulfilled' ? marginR.value : null;
-        const fundamentals = fundR.status  === 'fulfilled' ? fundR.value  : null;
-        const revenue      = revR.status   === 'fulfilled' ? revR.value   : null;
+        const hist = await getHistory(s.code, 120);
+        if (hist.length) { sparkMap.set(s.code, hist); setCache(`history:${s.code}:120`, hist, CACHE_TTL.history); }
+      } catch(e) {}
+    }
+
+    checkDeadline();
+
+    // ── 計算指標與評分（純 CPU，無 IO）────────────────────
+    const results = stocks.map(stock => {
+      try {
+        const hist         = sparkMap.get(stock.code) || [];
+        const chip         = getCache(`chip:${stock.code}`);
+        const margin       = getCache(`margin:${stock.code}`);
+        const fundamentals = getCache(`fund:${stock.code}`);
+        const revenue      = getCache(`rev:${stock.code}`);
         const ind = calcIndicators(hist, stock.price);
         const scored = calcStockScore(ind, chip, margin, fundamentals, revenue, hist, stock.price);
         return {
@@ -1066,18 +1117,16 @@ app.get("/scan", async (req, res) => {
           macd: ind.macd,
           macdHist: ind.macdHist,
           volTrend: ind.volTrend || "—",
-          // 評分系統
           score:       scored.score,
           grade:       scored.grade,
           gradeColor:  scored.gradeColor,
           scoreDetail: scored.detail,
-          // 各面向分數
-          fundScore:   scored.detail._fund  || 0,
-          techScore:   scored.detail._tech  || 0,
-          volScore:    scored.detail._vol   || 0,
-          chipScore:   scored.detail._chip  || 0,
-          marginScore: scored.detail._margin|| 0,
-          themeScore:  scored.detail._theme || 0,
+          fundScore:   scored.detail._fund   || 0,
+          techScore:   scored.detail._tech   || 0,
+          volScore:    scored.detail._vol    || 0,
+          chipScore:   scored.detail._chip   || 0,
+          marginScore: scored.detail._margin || 0,
+          themeScore:  scored.detail._theme  || 0,
         };
       } catch(e) {
         return { ...stock, direction: "—", bull: 0, bear: 0, score: 0, grade: "資料不足", gradeColor: "#374151" };

@@ -756,63 +756,87 @@ app.get("/scan", async (req, res) => {
     };
 
     // 並行抓所有熱門股最新價格
-    // 用 TWSE 即時行情抓股價（比 FinMind 快且不耗 token）
-    // 一次最多查 50 支，用 | 分隔
-    const BATCH_SIZE = 20;
-    const allPrices = [];
-    for (let i = 0; i < SCAN_STOCKS.length; i += BATCH_SIZE) {
-      const batch = SCAN_STOCKS.slice(i, i + BATCH_SIZE);
-      // 構建批次查詢（TSE + OTC 分開，因為 TWSE API 要指定市場）
-      const tseStocks = batch.filter(s => !s.code.startsWith("0") || s.code === "0050" || s.code === "0056");
-      const otcStocks = batch.filter(s => s.code.startsWith("0") && s.code !== "0050" && s.code !== "0056");
-      const etfStocks = batch.filter(s => s.code.startsWith("00"));
+    // ── 抓即時/最新股價 ────────────────────────────────────
+    // 策略：先試 TWSE 即時行情，失敗或非交易時段 fallback 到 FinMind 歷史資料
 
-      const fetchBatch = async (stocks, mkt) => {
-        if (!stocks.length) return [];
-        const exch = stocks.map(s => `${mkt}_${s.code}.tw`).join("|");
-        const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${encodeURIComponent(exch)}&json=1&delay=0`;
-        try {
-          const r = await fetchWithTimeout(url, { headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" } }, 8000);
-          const data = await r.json();
-          return (data?.msgArray || []).map(item => {
-            const price = parseFloat(item.z !== "-" ? item.z : item.y) || 0;
-            const prev  = parseFloat(item.y) || 0;
-            if (!price) return null;
-            const change = +(price - prev).toFixed(2);
-            const changePct = prev > 0 ? ((change/prev)*100).toFixed(2) : "0";
-            const s = SCAN_STOCKS.find(s => s.code === item.c);
-            return {
-              code: item.c,
-              name: item.n || (s?.name) || item.c,
-              price,
-              change,
-              changePct: changePct + "%",
-              volume: parseInt((item.v||"0").replace(/,/g,"")) || 0,
-            };
-          }).filter(Boolean);
-        } catch(e) { return []; }
-      };
+    const fetchTWSEBatch = async (codes) => {
+      // TWSE 批次查詢（一次查全部，用 | 分隔）
+      const exch = codes.map(c => `tse_${c}.tw`).join("|");
+      const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${encodeURIComponent(exch)}&json=1&delay=0`;
+      try {
+        const r = await fetchWithTimeout(url, {
+          headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" }
+        }, 8000);
+        const data = await r.json();
+        const items = data?.msgArray || [];
+        // 過濾掉沒有價格的（非交易時段 item.z="-" 但 item.y 有昨收）
+        return items.map(item => {
+          const price = parseFloat(item.z !== "-" ? item.z : item.y) || 0;
+          if (!price) return null;
+          const prev   = parseFloat(item.y) || price;
+          const change = item.z !== "-" ? +(price - prev).toFixed(2) : 0;
+          const changePct = prev > 0 && change !== 0
+            ? ((change/prev)*100).toFixed(2) : "0";
+          const s = SCAN_STOCKS.find(s => s.code === item.c);
+          return {
+            code: item.c,
+            name: item.n || (s?.name) || item.c,
+            price,
+            change,
+            changePct: changePct + "%",
+            volume: parseInt((item.v||"0").replace(/,/g,"")) || 0,
+            isRealtime: item.z !== "-",
+          };
+        }).filter(Boolean);
+      } catch(e) { return []; }
+    };
 
-      // TSE 上市
-      const tseResults = await fetchBatch(
-        batch.filter(s => !["00878","00919","0050","0056"].includes(s.code)),
-        "tse"
-      );
-      // ETF（用 tse 也可以查到大部分 ETF）
-      const etfResults = await fetchBatch(
-        batch.filter(s => ["00878","00919","0050","0056"].includes(s.code)),
-        "tse"
-      );
+    // FinMind fallback：抓最近一個交易日收盤價
+    const fetchFinMindPrice = async (s) => {
+      const cacheKey = `price:${s.code}`;
+      const cached = getCache(cacheKey);
+      if (cached) return cached;
+      try {
+        const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${s.code}&start_date=${weekAgo}&end_date=${today}&token=${token}`;
+        const r = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } }, 8000);
+        const data = await r.json();
+        const rows = (data?.data || []);
+        if (!rows.length) return null;
+        const latest = rows.at(-1);
+        const prev   = rows.at(-2) || latest;
+        const price  = parseFloat(latest.close) || 0;
+        if (!price) return null;
+        const prevP  = parseFloat(prev.close) || price;
+        const change = +(price - prevP).toFixed(2);
+        const changePct = prevP > 0 ? ((change/prevP)*100).toFixed(2) : "0";
+        const result = {
+          code: s.code, name: s.name, price, change,
+          changePct: changePct + "%",
+          volume: parseInt((latest.Trading_Volume||0) / 1000) || 0,
+          isRealtime: false,
+        };
+        setCache(cacheKey, result, 10 * 60 * 1000); // 10 分鐘
+        return result;
+      } catch(e) { return null; }
+    };
 
-      allPrices.push(...tseResults, ...etfResults);
-      if (i + BATCH_SIZE < SCAN_STOCKS.length) await new Promise(r => setTimeout(r, 100));
-    }
+    // 1. 先試 TWSE（所有股票一次查）
+    const twseResults = await fetchTWSEBatch(SCAN_STOCKS.map(s => s.code));
+    const twseMap = new Map(twseResults.map(s => [s.code, s]));
 
-    const priceList = allPrices;
+    // 2. TWSE 沒抓到的（盤後/假日），用 FinMind 補
+    const missing = SCAN_STOCKS.filter(s => !twseMap.has(s.code));
+    const fallbackResults = missing.length > 0
+      ? await batchFetch(missing, fetchFinMindPrice)
+      : [];
+    fallbackResults.forEach(s => { if (s) twseMap.set(s.code, s); });
+
+    // 3. 合併，保持 SCAN_STOCKS 順序
+    const priceList = SCAN_STOCKS.map(s => twseMap.get(s.code) || null);
 
     let stocks = priceList.filter(s => s && s.price > 0);
     if (!stocks.length) {
-      return res.json({ error: "無法取得資料，請稍後再試" });
+      return res.json({ error: "無法取得股價資料，可能是盤後時段或網路問題，請稍後再試" });
     }
 
     // 排序

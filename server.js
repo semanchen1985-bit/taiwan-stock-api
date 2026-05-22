@@ -110,7 +110,7 @@ app.use((req, res, next) => {
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    version: "2025-v7-parallel",   // ← 確認版本用
+    version: "2025-v8-chart-parallel",   // ← 確認版本用
     time: new Date().toISOString(),
     cache: CACHE.size,
     inFlight: IN_FLIGHT.size,
@@ -1003,35 +1003,79 @@ app.get("/scan", async (req, res) => {
 
     // ── quote + spark 並行（節省 ~10s）────────────────────
     const allCodes = SCAN_STOCKS.map(s => s.code);
-    const sparkSymbolsAll = allCodes.map(c => c + ".TW").join(",");
+    // ── quote + K線 並行（chart 各支並行）────
 
-    const [quoteRes, sparkRes] = await Promise.allSettled([
-      // A. Yahoo quote batch → 股價
-      fetchYahooBatch(allCodes),
-      // B. Yahoo spark batch → K 線（同時進行）
-      fetchWithTimeout(
-        `https://query1.finance.yahoo.com/v7/finance/spark?symbols=${encodeURIComponent(sparkSymbolsAll)}&range=6mo&interval=1d`,
-        { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Accept": "application/json" } },
-        12000
-      ).then(r => r.json()),
-    ]);
+    // Yahoo chart 單支抓取（含股價+K線，一次搞定）
+    const fetchYahooChart = async (code) => {
+      const cacheKey = `chart:${code}`;
+      const cached = getCache(cacheKey);
+      if (cached) return cached;
+      try {
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${code}.TW?interval=1d&range=6mo`;
+        const r = await fetchWithTimeout(url, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+          }
+        }, 8000);
+        const data = await r.json();
+        const result = data?.chart?.result?.[0];
+        if (!result) return null;
+        const meta = result.meta || {};
+        const timestamps = result.timestamp || [];
+        const q = result.indicators?.quote?.[0] || {};
+        const closes  = q.close  || [];
+        const opens   = q.open   || [];
+        const highs   = q.high   || [];
+        const lows    = q.low    || [];
+        const volumes = q.volume || [];
+        const hist = timestamps.map((ts, i) => ({
+          date:   new Date(ts * 1000).toISOString().split("T")[0],
+          open:   +(opens[i]   || closes[i] || 0).toFixed(2),
+          high:   +(highs[i]   || closes[i] || 0).toFixed(2),
+          low:    +(lows[i]    || closes[i] || 0).toFixed(2),
+          close:  +(closes[i]  || 0).toFixed(2),
+          volume: Math.round((volumes[i] || 0) / 1000),
+        })).filter(d => d.close > 0);
+        if (!hist.length) return null;
+        // 從 meta 取即時股價
+        const price   = meta.regularMarketPrice || hist.at(-1)?.close || 0;
+        const prev    = meta.previousClose || meta.chartPreviousClose || hist.at(-2)?.close || price;
+        const change  = +(price - prev).toFixed(2);
+        const changePct = prev > 0 ? ((change/prev)*100).toFixed(2) : "0";
+        const s = SCAN_STOCKS.find(s => s.code === code);
+        const result2 = {
+          stock: {
+            code, name: s?.name || meta.shortName || code,
+            price, change, changePct: changePct + "%",
+            volume: Math.round((meta.regularMarketVolume || 0) / 1000),
+          },
+          hist,
+        };
+        setCache(cacheKey, result2, CACHE_TTL.history);
+        return result2;
+      } catch(e) { return null; }
+    };
 
-    // 處理股價
-    const yahooResults = quoteRes.status === 'fulfilled' ? quoteRes.value : [];
-    console.log(`[scan] Yahoo quote: ${yahooResults.length}/${allCodes.length}`);
-    const priceMap = new Map(yahooResults.map(s => [s.code, s]));
+    // 全部並行（20支同時打，Yahoo 不限速）
+    console.log(`[scan] fetching ${allCodes.length} charts in parallel...`);
+    const chartResults = await Promise.allSettled(allCodes.map(fetchYahooChart));
 
-    // TWSE fallback（只補漏掉的）
-    const missingTWSE = SCAN_STOCKS.filter(s => !priceMap.has(s.code));
-    if (missingTWSE.length > 0) {
-      const twseResults = await fetchTWSEBatch(missingTWSE.map(s => s.code));
-      twseResults.forEach(s => { if (s) priceMap.set(s.code, s); });
-    }
-    // FinMind fallback
-    const missingFM = SCAN_STOCKS.filter(s => !priceMap.has(s.code));
-    if (missingFM.length > 0) {
-      const fmResults = await batchFetch(missingFM, fetchFinMindPrice);
-      fmResults.forEach(s => { if (s) priceMap.set(s.code, s); });
+    const priceMap = new Map();
+    const sparkMap = new Map();
+    chartResults.forEach((r, i) => {
+      if (r.status !== 'fulfilled' || !r.value) return;
+      const { stock, hist } = r.value;
+      if (stock.price > 0) priceMap.set(stock.code, stock);
+      if (hist.length > 0) sparkMap.set(stock.code, hist);
+    });
+    console.log(`[scan] chart: price=${priceMap.size}, hist=${sparkMap.size}/${allCodes.length}`);
+
+    // 股價 fallback（chart 沒抓到的）
+    const missingPrice = SCAN_STOCKS.filter(s => !priceMap.has(s.code));
+    if (missingPrice.length > 0) {
+      const yahooResults = await fetchYahooBatch(missingPrice.map(s => s.code));
+      yahooResults.forEach(s => { if (s) priceMap.set(s.code, s); });
     }
 
     let stocks = SCAN_STOCKS.map(s => priceMap.get(s.code) || null).filter(s => s?.price > 0);
@@ -1043,31 +1087,6 @@ app.get("/scan", async (req, res) => {
       ? parseFloat(b.changePct) - parseFloat(a.changePct)
       : b.volume - a.volume);
     stocks = stocks.slice(0, limit);
-
-    // 處理 spark K 線
-    const sparkMap = new Map();
-    if (sparkRes.status === 'fulfilled') {
-      const sparkResult = sparkRes.value?.spark?.result || [];
-      sparkResult.forEach(item => {
-        const code = (item.symbol || "").replace(".TW", "");
-        const resp = item.response?.[0];
-        if (!resp) return;
-        const timestamps = resp.timestamp || [];
-        const q = resp.indicators?.quote?.[0] || {};
-        const hist = timestamps.map((ts, i) => ({
-          date:   new Date(ts * 1000).toISOString().split("T")[0],
-          open:   +((q.open?.[i]   || q.close?.[i] || 0)).toFixed(2),
-          high:   +((q.high?.[i]   || q.close?.[i] || 0)).toFixed(2),
-          low:    +((q.low?.[i]    || q.close?.[i] || 0)).toFixed(2),
-          close:  +((q.close?.[i]  || 0)).toFixed(2),
-          volume: Math.round((q.volume?.[i] || 0) / 1000),
-        })).filter(d => d.close > 0);
-        if (hist.length > 0) sparkMap.set(code, hist);
-      });
-      console.log(`[scan] spark: ${sparkMap.size}/${stocks.length}`);
-    } else {
-      console.error("[scan] spark failed:", sparkRes.reason?.message);
-    }
     checkDeadline();
 
     // ── 計算指標與評分（純 CPU，無 IO）────────────────────

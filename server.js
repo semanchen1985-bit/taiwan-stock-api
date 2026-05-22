@@ -109,13 +109,59 @@ app.use((req, res, next) => {
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    version: "2025-v3-scoring",   // ← 確認版本用
+    version: "2025-v4-yahoo",   // ← 確認版本用
     time: new Date().toISOString(),
     cache: CACHE.size,
     inFlight: IN_FLIGHT.size,
     uptime: Math.floor(process.uptime()) + "s",
     memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB",
   });
+});
+
+// 測試各 API 連通性
+app.get("/test-apis", async (req, res) => {
+  const results = {};
+
+  // 1. Yahoo Finance
+  try {
+    const r = await fetchWithTimeout(
+      "https://query1.finance.yahoo.com/v7/finance/quote?symbols=2330.TW",
+      { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json" } },
+      8000
+    );
+    const d = await r.json();
+    const price = d?.quoteResponse?.result?.[0]?.regularMarketPrice;
+    results.yahoo = price ? `✅ 台積電: ${price}` : "⚠ 無資料";
+  } catch(e) { results.yahoo = "❌ " + e.message; }
+
+  // 2. TWSE
+  try {
+    const r = await fetchWithTimeout(
+      "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw&json=1&delay=0",
+      { headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" } },
+      5000
+    );
+    const d = await r.json();
+    const item = d?.msgArray?.[0];
+    results.twse = item ? `✅ z=${item.z} y=${item.y}` : "⚠ 無資料";
+  } catch(e) { results.twse = "❌ " + e.message; }
+
+  // 3. FinMind
+  try {
+    const token = process.env.FINMIND_TOKEN || "";
+    const today = new Date().toISOString().split("T")[0];
+    const start = new Date(Date.now()-14*24*60*60*1000).toISOString().split("T")[0];
+    const r = await fetchWithTimeout(
+      `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=2330&start_date=${start}&end_date=${today}&token=${token}`,
+      { headers: { "User-Agent": "Mozilla/5.0" } },
+      8000
+    );
+    const d = await r.json();
+    const rows = d?.data || [];
+    results.finmind = rows.length ? `✅ ${rows.length} 筆，最新: ${rows.at(-1)?.close}` : `⚠ 無資料 msg=${d?.msg||""}`;
+  } catch(e) { results.finmind = "❌ " + e.message; }
+
+  res.json({ time: new Date().toISOString(), apis: results });
 });
 
 // ── 股票搜尋 API（即時查 TWSE + FinMind）────────────────
@@ -804,7 +850,10 @@ app.get("/scan", async (req, res) => {
             isRealtime: true,
           };
         }).filter(Boolean);
-      } catch(e) { return []; }
+      } catch(e) {
+        console.error("[Yahoo] error:", e.message);
+        return [];
+      }
     };
 
     // TWSE 備用（若 Yahoo 失敗）
@@ -832,7 +881,10 @@ app.get("/scan", async (req, res) => {
             isRealtime: item.z !== "-",
           };
         }).filter(Boolean);
-      } catch(e) { return []; }
+      } catch(e) {
+        console.error("[TWSE] error:", e.message);
+        return [];
+      }
     };
 
     // FinMind fallback：抓最近一個交易日收盤價
@@ -868,25 +920,32 @@ app.get("/scan", async (req, res) => {
     // Yahoo Finance 批次一次查所有
     const allCodes = SCAN_STOCKS.map(s => s.code);
     let yahooResults = await fetchYahooBatch(allCodes);
+    console.log(`[scan] Yahoo: ${yahooResults.length}/${allCodes.length} stocks`);
     const priceMap = new Map(yahooResults.map(s => [s.code, s]));
 
     // Yahoo 沒抓到的 → 試 TWSE
     const missingTWSE = SCAN_STOCKS.filter(s => !priceMap.has(s.code));
     if (missingTWSE.length > 0) {
+      console.log(`[scan] TWSE fallback for ${missingTWSE.length} stocks`);
       const twseResults = await fetchTWSEBatch(missingTWSE.map(s => s.code));
+      console.log(`[scan] TWSE got: ${twseResults.length}`);
       twseResults.forEach(s => { if (s) priceMap.set(s.code, s); });
     }
 
     // 還是沒有的 → FinMind fallback
     const missingFM = SCAN_STOCKS.filter(s => !priceMap.has(s.code));
     if (missingFM.length > 0) {
+      console.log(`[scan] FinMind fallback for ${missingFM.length} stocks`);
       const fmResults = await batchFetch(missingFM, fetchFinMindPrice);
+      const fmGot = fmResults.filter(Boolean).length;
+      console.log(`[scan] FinMind got: ${fmGot}`);
       fmResults.forEach(s => { if (s) priceMap.set(s.code, s); });
     }
 
     const priceList = SCAN_STOCKS.map(s => priceMap.get(s.code) || null);
 
     let stocks = priceList.filter(s => s && s.price > 0);
+    console.log(`[scan] final stocks: ${stocks.length}`);
     if (!stocks.length) {
       return res.json({ error: "無法取得股價資料，可能是盤後時段或網路問題，請稍後再試" });
     }

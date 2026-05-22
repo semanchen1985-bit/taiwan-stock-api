@@ -174,27 +174,48 @@ app.get("/search", async (req, res) => {
 // ── TWSE 即時報價 ─────────────────────────────────────────
 async function getQuote(code) {
   try {
-    for (const [market, ex] of [["上市","tse"],["上櫃","otc"]]) {
-      const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${ex}_${code}.tw&json=1&delay=0&_=${Date.now()}`;
-      const r = await fetchWithTimeout(url, { headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" } }, 5000);
-      const data = await r.json();
-      const q = data?.msgArray?.[0];
-      if (!q?.n) continue;
-      const price = parseFloat(q.z || q.b || q.c || 0);
-      const prev  = parseFloat(q.y || 0);
-      return {
-        code, name: q.n, market, price, prev,
-        change: price&&prev ? +(price-prev).toFixed(2) : 0,
-        changePct: price&&prev ? ((price-prev)/prev*100).toFixed(2) : "0.00",
-        open: parseFloat(q.o||0), high: parseFloat(q.h||0),
-        low: parseFloat(q.l||0), volume: parseInt(q.v||0)
-      };
+    // TWSE/OTC 即時行情（不需 token，支援上市+上櫃+ETF）
+    const isTSE = !code.startsWith("00") || code === "0050" || code === "0056";
+    // 試 TSE 先，失敗再試 OTC
+    const tryMarkets = isTSE ? ["tse", "otc"] : ["otc", "tse"];
+    for (const mkt of tryMarkets) {
+      const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${mkt}_${code}.tw&json=1&delay=0`;
+      try {
+        const r = await fetchWithTimeout(url, {
+          headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" }
+        }, 5000);
+        const data = await r.json();
+        const item = (data?.msgArray || [])[0];
+        if (!item || !item.z || item.z === "-") continue; // 沒成交價，試下一個市場
+        const price  = parseFloat(item.z) || parseFloat(item.y) || 0; // z=成交 y=昨收
+        const prev   = parseFloat(item.y) || 0;
+        const open   = parseFloat(item.o) || 0;
+        const high   = parseFloat(item.h) || 0;
+        const low    = parseFloat(item.l) || 0;
+        const vol    = parseInt((item.v || "0").replace(/,/g, "")) || 0;
+        const change = +(price - prev).toFixed(2);
+        const changePct = prev > 0 ? +((change / prev) * 100).toFixed(2) : 0;
+        return {
+          code,
+          name:      item.n  || code,
+          price,
+          prev,
+          change,
+          changePct,
+          open,
+          high,
+          low,
+          volume:    vol,
+          market:    mkt === "tse" ? "上市" : "上櫃",
+          time:      item.t  || "",
+        };
+      } catch(e) { continue; }
     }
-  } catch(e) {}
-  return null;
+    return null;
+  } catch(e) { return null; }
 }
 
-// ── FinMind 歷史日K ───────────────────────────────────────
+
 async function getHistoryCached(code) {
   const cacheKey = `history:${code}`;
   const cached = getCache(cacheKey);
@@ -720,7 +741,7 @@ app.get("/scan", async (req, res) => {
   try {
     const token = process.env.FINMIND_TOKEN || "";
     const today = new Date().toISOString().split("T")[0];
-    const weekAgo = new Date(Date.now()-7*24*60*60*1000).toISOString().split("T")[0];
+    const weekAgo = new Date(Date.now()-14*24*60*60*1000).toISOString().split("T")[0]; // 14天確保有資料
 
     // 批次抓熱門股（每批 10 支，避免 FinMind rate limit）
     const batchFetch = async (list, fn) => {
@@ -735,29 +756,59 @@ app.get("/scan", async (req, res) => {
     };
 
     // 並行抓所有熱門股最新價格
-    const priceList = await batchFetch(SCAN_STOCKS, async (s) => {
+    // 用 TWSE 即時行情抓股價（比 FinMind 快且不耗 token）
+    // 一次最多查 50 支，用 | 分隔
+    const BATCH_SIZE = 20;
+    const allPrices = [];
+    for (let i = 0; i < SCAN_STOCKS.length; i += BATCH_SIZE) {
+      const batch = SCAN_STOCKS.slice(i, i + BATCH_SIZE);
+      // 構建批次查詢（TSE + OTC 分開，因為 TWSE API 要指定市場）
+      const tseStocks = batch.filter(s => !s.code.startsWith("0") || s.code === "0050" || s.code === "0056");
+      const otcStocks = batch.filter(s => s.code.startsWith("0") && s.code !== "0050" && s.code !== "0056");
+      const etfStocks = batch.filter(s => s.code.startsWith("00"));
+
+      const fetchBatch = async (stocks, mkt) => {
+        if (!stocks.length) return [];
+        const exch = stocks.map(s => `${mkt}_${s.code}.tw`).join("|");
+        const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${encodeURIComponent(exch)}&json=1&delay=0`;
         try {
-          const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${s.code}&start_date=${weekAgo}&end_date=${today}&token=${token}`;
-          const r = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } }, 8000);
+          const r = await fetchWithTimeout(url, { headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" } }, 8000);
           const data = await r.json();
-          const rows = data?.data || [];
-          if (!rows.length) return null;
-          const latest = rows.at(-1) || {};
-          const prev = rows.at(-2) || {};
-          const price = parseFloat(latest.close);
-          const prevPrice = prev ? parseFloat(prev.close) : price;
-          const change = price - prevPrice;
-          const changePct = prevPrice ? ((change/prevPrice)*100).toFixed(2) : "0";
-          return {
-            code: s.code,
-            name: s.name,
-            price,
-            change: +change.toFixed(2),
-            changePct: changePct + "%",
-            volume: parseInt(latest.Trading_Volume/1000) || 0,
-          };
-        } catch(e) { return null; }
-    });
+          return (data?.msgArray || []).map(item => {
+            const price = parseFloat(item.z !== "-" ? item.z : item.y) || 0;
+            const prev  = parseFloat(item.y) || 0;
+            if (!price) return null;
+            const change = +(price - prev).toFixed(2);
+            const changePct = prev > 0 ? ((change/prev)*100).toFixed(2) : "0";
+            const s = SCAN_STOCKS.find(s => s.code === item.c);
+            return {
+              code: item.c,
+              name: item.n || (s?.name) || item.c,
+              price,
+              change,
+              changePct: changePct + "%",
+              volume: parseInt((item.v||"0").replace(/,/g,"")) || 0,
+            };
+          }).filter(Boolean);
+        } catch(e) { return []; }
+      };
+
+      // TSE 上市
+      const tseResults = await fetchBatch(
+        batch.filter(s => !["00878","00919","0050","0056"].includes(s.code)),
+        "tse"
+      );
+      // ETF（用 tse 也可以查到大部分 ETF）
+      const etfResults = await fetchBatch(
+        batch.filter(s => ["00878","00919","0050","0056"].includes(s.code)),
+        "tse"
+      );
+
+      allPrices.push(...tseResults, ...etfResults);
+      if (i + BATCH_SIZE < SCAN_STOCKS.length) await new Promise(r => setTimeout(r, 100));
+    }
+
+    const priceList = allPrices;
 
     let stocks = priceList.filter(s => s && s.price > 0);
     if (!stocks.length) {

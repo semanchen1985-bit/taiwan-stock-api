@@ -827,18 +827,20 @@ app.get("/scan", async (req, res) => {
     checkDeadline(); // 確保還在 25s 內
     const results = await batchFetch(stocks, async (stock) => {
       try {
-        // Lightweight mode：優先用 cache，cache miss 的 chip/margin/fund/rev 直接跳過
-        // 這樣 cache hot 時只打 history（1 call），避免 FinMind 每次 120 calls
-        const useCached = (fn, key) => {
+        // Scan lightweight mode：
+        // - history 永遠抓（技術面需要）
+        // - chip/margin/fund/rev：cache 有就用，cache miss 就 skip（不打 API）
+        //   避免 20 支股票 × 4 API = 80 calls 超過 FinMind rate limit 或 25s deadline
+        const skipIfNoCached = (key) => {
           const ck = getCache(key);
-          return ck !== null ? Promise.resolve(ck) : fn(stock.code);
+          return ck !== null ? Promise.resolve(ck) : Promise.resolve(null);
         };
         const [histR, chipR, marginR, fundR, revR] = await Promise.allSettled([
           getHistoryCached(stock.code),
-          useCached(getChip,         `chip:${stock.code}`),
-          useCached(getMargin,       `margin:${stock.code}`),
-          useCached(getFundamentals, `fund:${stock.code}`),
-          useCached(getRevenue,      `rev:${stock.code}`),
+          skipIfNoCached(`chip:${stock.code}`),
+          skipIfNoCached(`margin:${stock.code}`),
+          skipIfNoCached(`fund:${stock.code}`),
+          skipIfNoCached(`rev:${stock.code}`),
         ]);
         const hist         = histR.status  === 'fulfilled' ? histR.value  : [];
         const chip         = chipR.status  === 'fulfilled' ? chipR.value  : null;
@@ -884,7 +886,17 @@ app.get("/scan", async (req, res) => {
       const final = results.map(s => ({ ...s, suggestion: s.grade || "觀察中" }));
       const respData = { mode, stocks: final, time: new Date().toISOString() };
       setCache(scanCacheKey, respData, CACHE_TTL.scan);
-      return res.json(respData);
+      res.json(respData);
+      // 背景預載籌碼
+      setImmediate(async () => {
+        for (const s of final.slice(0, 10)) {
+          try {
+            await Promise.allSettled([getChip(s.code), getMargin(s.code), getFundamentals(s.code), getRevenue(s.code)]);
+            await new Promise(r => setTimeout(r, 500));
+          } catch(e) {}
+        }
+      });
+      return;
     }
     const prompt = `你是台股職業交易員，根據以下${limit}支熱門股評分資料，每支給出一句話操作建議（15字內），格式：代號|建議
 
@@ -932,6 +944,22 @@ ${
     const respData = { mode, stocks: final, time: new Date().toISOString() };
     setCache(scanCacheKey, respData, CACHE_TTL.scan);
     res.json(respData);
+
+    // 背景非同步預載籌碼資料（不阻塞回應）
+    // 下次 scan 時 cache 已有籌碼，評分會完整
+    setImmediate(async () => {
+      for (const s of final.slice(0, 10)) { // 只預載前 10 支
+        try {
+          await Promise.allSettled([
+            getChip(s.code),
+            getMargin(s.code),
+            getFundamentals(s.code),
+            getRevenue(s.code),
+          ]);
+          await new Promise(r => setTimeout(r, 500)); // 每支間隔 500ms，避免 rate limit
+        } catch(e) {}
+      }
+    });
 
   } catch(e) {
     console.error("scan error:", e.message);

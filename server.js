@@ -884,7 +884,7 @@ app.get("/scan", async (req, res) => {
     // 用 Claude 快速產生一句話結論（沒有 key 就跳過）
     if (!key) {
       const final = results.map(s => ({ ...s, suggestion: s.grade || "觀察中" }));
-      const respData = { mode, stocks: final, time: new Date().toISOString() };
+      const respData = { mode, stocks: final, time: new Date().toISOString(), _v: "scoring-v3" };
       setCache(scanCacheKey, respData, CACHE_TTL.scan);
       res.json(respData);
       // 背景預載籌碼
@@ -941,7 +941,7 @@ ${
       suggestion: suggestions[s.code] || "觀察中"
     }));
 
-    const respData = { mode, stocks: final, time: new Date().toISOString() };
+    const respData = { mode, stocks: final, time: new Date().toISOString(), _v: "scoring-v3" };
     setCache(scanCacheKey, respData, CACHE_TTL.scan);
     res.json(respData);
 

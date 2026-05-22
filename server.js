@@ -126,6 +126,7 @@ async function getStockList() {
   if (stockCache && Date.now() - stockCacheTime < 24*60*60*1000) {
     return stockCache;
   }
+  let _partialResults = [];
   try {
     const token = process.env.FINMIND_TOKEN || "";
     const r = await fetch(
@@ -567,7 +568,7 @@ function calcStockScore(ind, chip, margin, fundamentals, revenue, history, price
   else detail.ma_bull = "0 非多頭排列(" + ind.maTrend + ")";
 
   // 突破前高或平台整理：股價近 5% 內接近或超過 20 日最高
-  const high20 = history?.length >= 20 ? Math.max(...history.slice(-20).map(h => h.high || h.close)) : null;
+  const high20 = history?.length >= 20 ? history.slice(-20).reduce((mx,h)=>Math.max(mx,h.high||h.close),-Infinity) : null;
   if (high20 && p >= high20 * 0.98) { techScore += 5; detail.breakout = "+5 近20日高點附近突破"; }
   else detail.breakout = "0 未突破前高";
 
@@ -824,6 +825,7 @@ app.get("/scan", async (req, res) => {
     
     // 依評分由高到低重新排序
     results.sort((a, b) => b.score - a.score);
+    _partialResults = results; // 供 timeout catch 使用
 
     // 用 Claude 快速產生一句話結論（沒有 key 就跳過）
     if (!key) {
@@ -882,7 +884,10 @@ ${
   } catch(e) {
     console.error("scan error:", e.message);
     if (e.message === 'scan timeout') {
-      // 有部分結果就回傳
+      const partial = (_partialResults || []).filter(s => s && s.score != null);
+      if (partial.length > 0) {
+        return res.json({ mode, stocks: partial, error: "掃描逾時（部分結果）", time: new Date().toISOString() });
+      }
       return res.json({ mode, stocks: [], error: "掃描逾時，請重試（後端冷啟動中）", time: new Date().toISOString() });
     }
     res.status(500).json({ error: e.message });

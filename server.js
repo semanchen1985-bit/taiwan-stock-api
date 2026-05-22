@@ -173,46 +173,59 @@ app.get("/search", async (req, res) => {
 
 // ── TWSE 即時報價 ─────────────────────────────────────────
 async function getQuote(code) {
+  // 優先用 Yahoo Finance（Render 伺服器能存取，不受地區限制）
   try {
-    // TWSE/OTC 即時行情（不需 token，支援上市+上櫃+ETF）
-    const isTSE = !code.startsWith("00") || code === "0050" || code === "0056";
-    // 試 TSE 先，失敗再試 OTC
-    const tryMarkets = isTSE ? ["tse", "otc"] : ["otc", "tse"];
-    for (const mkt of tryMarkets) {
-      const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${mkt}_${code}.tw&json=1&delay=0`;
-      try {
-        const r = await fetchWithTimeout(url, {
-          headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" }
-        }, 5000);
-        const data = await r.json();
-        const item = (data?.msgArray || [])[0];
-        if (!item || !item.z || item.z === "-") continue; // 沒成交價，試下一個市場
-        const price  = parseFloat(item.z) || parseFloat(item.y) || 0; // z=成交 y=昨收
-        const prev   = parseFloat(item.y) || 0;
-        const open   = parseFloat(item.o) || 0;
-        const high   = parseFloat(item.h) || 0;
-        const low    = parseFloat(item.l) || 0;
-        const vol    = parseInt((item.v || "0").replace(/,/g, "")) || 0;
-        const change = +(price - prev).toFixed(2);
-        const changePct = prev > 0 ? +((change / prev) * 100).toFixed(2) : 0;
-        return {
-          code,
-          name:      item.n  || code,
-          price,
-          prev,
-          change,
-          changePct,
-          open,
-          high,
-          low,
-          volume:    vol,
-          market:    mkt === "tse" ? "上市" : "上櫃",
-          time:      item.t  || "",
-        };
-      } catch(e) { continue; }
+    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${code}.TW`;
+    const r = await fetchWithTimeout(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json" }
+    }, 8000);
+    const data = await r.json();
+    const q = (data?.quoteResponse?.result || [])[0];
+    if (q && q.regularMarketPrice) {
+      const price  = q.regularMarketPrice;
+      const prev   = q.regularMarketPreviousClose || price;
+      const change = +(q.regularMarketChange || 0).toFixed(2);
+      const changePct = +((q.regularMarketChangePercent || 0)).toFixed(2);
+      return {
+        code,
+        name:      q.shortName || q.longName || code,
+        price,
+        prev,
+        change,
+        changePct,
+        open:      q.regularMarketOpen   || price,
+        high:      q.regularMarketDayHigh|| price,
+        low:       q.regularMarketDayLow || price,
+        volume:    Math.round((q.regularMarketVolume || 0) / 1000),
+        market:    "上市",
+        time:      "",
+      };
     }
-    return null;
-  } catch(e) { return null; }
+  } catch(e) {}
+
+  // Fallback: TWSE 即時行情
+  try {
+    for (const mkt of ["tse", "otc"]) {
+      const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${mkt}_${code}.tw&json=1&delay=0`;
+      const r = await fetchWithTimeout(url, {
+        headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" }
+      }, 5000);
+      const data = await r.json();
+      const item = (data?.msgArray || [])[0];
+      if (!item || !item.z || item.z === "-") continue;
+      const price  = parseFloat(item.z) || 0;
+      const prev   = parseFloat(item.y) || 0;
+      const change = +(price - prev).toFixed(2);
+      const changePct = prev > 0 ? +((change/prev)*100).toFixed(2) : 0;
+      return {
+        code, name: item.n || code, price, prev, change, changePct,
+        open: parseFloat(item.o)||0, high: parseFloat(item.h)||0, low: parseFloat(item.l)||0,
+        volume: parseInt((item.v||"0").replace(/,/g,""))||0,
+        market: mkt === "tse" ? "上市" : "上櫃", time: item.t||"",
+      };
+    }
+  } catch(e) {}
+  return null;
 }
 
 
@@ -759,8 +772,43 @@ app.get("/scan", async (req, res) => {
     // ── 抓即時/最新股價 ────────────────────────────────────
     // 策略：先試 TWSE 即時行情，失敗或非交易時段 fallback 到 FinMind 歷史資料
 
+    // Yahoo Finance 批次查詢（免費、無需 token、全球都能存取）
+    const fetchYahooBatch = async (codes) => {
+      // Yahoo Finance 台股代號格式：2330.TW, 00878.TW
+      const symbols = codes.map(c => c + ".TW").join(",");
+      const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols)}&fields=regularMarketPrice,regularMarketPreviousClose,regularMarketChange,regularMarketChangePercent,regularMarketVolume,shortName,longName`;
+      try {
+        const r = await fetchWithTimeout(url, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+          }
+        }, 10000);
+        const data = await r.json();
+        const quotes = data?.quoteResponse?.result || [];
+        return quotes.map(q => {
+          const code = (q.symbol || "").replace(".TW","");
+          const price = q.regularMarketPrice || 0;
+          if (!price) return null;
+          const prev   = q.regularMarketPreviousClose || price;
+          const change = +(q.regularMarketChange || 0).toFixed(2);
+          const changePct = ((q.regularMarketChangePercent || 0)).toFixed(2);
+          const s = SCAN_STOCKS.find(s => s.code === code);
+          return {
+            code,
+            name: s?.name || q.shortName || q.longName || code,
+            price,
+            change,
+            changePct: changePct + "%",
+            volume: Math.round((q.regularMarketVolume || 0) / 1000), // 轉張
+            isRealtime: true,
+          };
+        }).filter(Boolean);
+      } catch(e) { return []; }
+    };
+
+    // TWSE 備用（若 Yahoo 失敗）
     const fetchTWSEBatch = async (codes) => {
-      // TWSE 批次查詢（一次查全部，用 | 分隔）
       const exch = codes.map(c => `tse_${c}.tw`).join("|");
       const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${encodeURIComponent(exch)}&json=1&delay=0`;
       try {
@@ -768,21 +816,17 @@ app.get("/scan", async (req, res) => {
           headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" }
         }, 8000);
         const data = await r.json();
-        const items = data?.msgArray || [];
-        // 過濾掉沒有價格的（非交易時段 item.z="-" 但 item.y 有昨收）
-        return items.map(item => {
+        return (data?.msgArray || []).map(item => {
           const price = parseFloat(item.z !== "-" ? item.z : item.y) || 0;
           if (!price) return null;
-          const prev   = parseFloat(item.y) || price;
-          const change = item.z !== "-" ? +(price - prev).toFixed(2) : 0;
-          const changePct = prev > 0 && change !== 0
-            ? ((change/prev)*100).toFixed(2) : "0";
+          const prev = parseFloat(item.y) || price;
+          const change = +(price - prev).toFixed(2);
+          const changePct = prev > 0 ? ((change/prev)*100).toFixed(2) : "0";
           const s = SCAN_STOCKS.find(s => s.code === item.c);
           return {
             code: item.c,
-            name: item.n || (s?.name) || item.c,
-            price,
-            change,
+            name: item.n || s?.name || item.c,
+            price, change,
             changePct: changePct + "%",
             volume: parseInt((item.v||"0").replace(/,/g,"")) || 0,
             isRealtime: item.z !== "-",
@@ -820,19 +864,27 @@ app.get("/scan", async (req, res) => {
       } catch(e) { return null; }
     };
 
-    // 1. 先試 TWSE（所有股票一次查）
-    const twseResults = await fetchTWSEBatch(SCAN_STOCKS.map(s => s.code));
-    const twseMap = new Map(twseResults.map(s => [s.code, s]));
+    // 股價抓取：Yahoo Finance（主）→ TWSE（備）→ FinMind（最後）
+    // Yahoo Finance 批次一次查所有
+    const allCodes = SCAN_STOCKS.map(s => s.code);
+    let yahooResults = await fetchYahooBatch(allCodes);
+    const priceMap = new Map(yahooResults.map(s => [s.code, s]));
 
-    // 2. TWSE 沒抓到的（盤後/假日），用 FinMind 補
-    const missing = SCAN_STOCKS.filter(s => !twseMap.has(s.code));
-    const fallbackResults = missing.length > 0
-      ? await batchFetch(missing, fetchFinMindPrice)
-      : [];
-    fallbackResults.forEach(s => { if (s) twseMap.set(s.code, s); });
+    // Yahoo 沒抓到的 → 試 TWSE
+    const missingTWSE = SCAN_STOCKS.filter(s => !priceMap.has(s.code));
+    if (missingTWSE.length > 0) {
+      const twseResults = await fetchTWSEBatch(missingTWSE.map(s => s.code));
+      twseResults.forEach(s => { if (s) priceMap.set(s.code, s); });
+    }
 
-    // 3. 合併，保持 SCAN_STOCKS 順序
-    const priceList = SCAN_STOCKS.map(s => twseMap.get(s.code) || null);
+    // 還是沒有的 → FinMind fallback
+    const missingFM = SCAN_STOCKS.filter(s => !priceMap.has(s.code));
+    if (missingFM.length > 0) {
+      const fmResults = await batchFetch(missingFM, fetchFinMindPrice);
+      fmResults.forEach(s => { if (s) priceMap.set(s.code, s); });
+    }
+
+    const priceList = SCAN_STOCKS.map(s => priceMap.get(s.code) || null);
 
     let stocks = priceList.filter(s => s && s.price > 0);
     if (!stocks.length) {

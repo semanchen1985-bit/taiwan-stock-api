@@ -31,7 +31,8 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 // ── Background 任務 ─────────────────────────────────────────
-const PORT_INTERNAL = process.env.PORT || 3001;
+const PORT          = process.env.PORT || 3001;
+const PORT_INTERNAL = PORT;
 
 // 1. 防 Render 冷啟動（每 14 分鐘 self-ping）
 setInterval(() => {
@@ -59,7 +60,7 @@ const CACHE_TTL = {
   margin:       30 * 60 * 1000,   // 30 分鐘（融資融券一天更新一次）
   fundamentals:  6 * 60 * 60 * 1000, // 6 小時
   revenue:      12 * 60 * 60 * 1000, // 12 小時（月營收）
-  scan:          3 * 60 * 1000,   // 3 分鐘（掃描結果）
+  scan:          5 * 60 * 1000,   // 5 分鐘（掃描結果）
 };
 function getCache(key) {
   const entry = CACHE.get(key);
@@ -109,7 +110,7 @@ app.use((req, res, next) => {
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    version: "2025-v6-spark",   // ← 確認版本用
+    version: "2025-v7-parallel",   // ← 確認版本用
     time: new Date().toISOString(),
     cache: CACHE.size,
     inFlight: IN_FLIGHT.size,
@@ -878,7 +879,7 @@ app.get("/scan", async (req, res) => {
   // 記錄活動時間（供背景預熱判斷）
   _lastScanActivity = Date.now();
   // Render 免費版 30s timeout 保護
-  const scanDeadline = Date.now() + 25000; // 25s 截止
+  const scanDeadline = Date.now() + 27000; // 27s 截止（Render 30s limit）
   const checkDeadline = () => { if (Date.now() > scanDeadline) throw new Error("scan timeout"); };
 
   try {
@@ -1000,101 +1001,73 @@ app.get("/scan", async (req, res) => {
       } catch(e) { return null; }
     };
 
-    // 股價抓取：Yahoo Finance（主）→ TWSE（備）→ FinMind（最後）
-    // Yahoo Finance 批次一次查所有
+    // ── quote + spark 並行（節省 ~10s）────────────────────
     const allCodes = SCAN_STOCKS.map(s => s.code);
-    let yahooResults = await fetchYahooBatch(allCodes);
-    console.log(`[scan] Yahoo: ${yahooResults.length}/${allCodes.length} stocks`);
+    const sparkSymbolsAll = allCodes.map(c => c + ".TW").join(",");
+
+    const [quoteRes, sparkRes] = await Promise.allSettled([
+      // A. Yahoo quote batch → 股價
+      fetchYahooBatch(allCodes),
+      // B. Yahoo spark batch → K 線（同時進行）
+      fetchWithTimeout(
+        `https://query1.finance.yahoo.com/v7/finance/spark?symbols=${encodeURIComponent(sparkSymbolsAll)}&range=6mo&interval=1d`,
+        { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Accept": "application/json" } },
+        12000
+      ).then(r => r.json()),
+    ]);
+
+    // 處理股價
+    const yahooResults = quoteRes.status === 'fulfilled' ? quoteRes.value : [];
+    console.log(`[scan] Yahoo quote: ${yahooResults.length}/${allCodes.length}`);
     const priceMap = new Map(yahooResults.map(s => [s.code, s]));
 
-    // Yahoo 沒抓到的 → 試 TWSE
+    // TWSE fallback（只補漏掉的）
     const missingTWSE = SCAN_STOCKS.filter(s => !priceMap.has(s.code));
     if (missingTWSE.length > 0) {
-      console.log(`[scan] TWSE fallback for ${missingTWSE.length} stocks`);
       const twseResults = await fetchTWSEBatch(missingTWSE.map(s => s.code));
-      console.log(`[scan] TWSE got: ${twseResults.length}`);
       twseResults.forEach(s => { if (s) priceMap.set(s.code, s); });
     }
-
-    // 還是沒有的 → FinMind fallback
+    // FinMind fallback
     const missingFM = SCAN_STOCKS.filter(s => !priceMap.has(s.code));
     if (missingFM.length > 0) {
-      console.log(`[scan] FinMind fallback for ${missingFM.length} stocks`);
       const fmResults = await batchFetch(missingFM, fetchFinMindPrice);
-      const fmGot = fmResults.filter(Boolean).length;
-      console.log(`[scan] FinMind got: ${fmGot}`);
       fmResults.forEach(s => { if (s) priceMap.set(s.code, s); });
     }
 
-    const priceList = SCAN_STOCKS.map(s => priceMap.get(s.code) || null);
+    let stocks = SCAN_STOCKS.map(s => priceMap.get(s.code) || null).filter(s => s?.price > 0);
+    console.log(`[scan] stocks with price: ${stocks.length}`);
+    if (!stocks.length) return res.json({ error: "無法取得股價資料，可能是盤後時段或網路問題" });
 
-    let stocks = priceList.filter(s => s && s.price > 0);
-    console.log(`[scan] final stocks: ${stocks.length}`);
-    if (!stocks.length) {
-      return res.json({ error: "無法取得股價資料，可能是盤後時段或網路問題，請稍後再試" });
-    }
-
-    // 排序
-    if (mode === "change") {
-      stocks.sort((a,b) => parseFloat(b.changePct) - parseFloat(a.changePct));
-    } else {
-      stocks.sort((a,b) => b.volume - a.volume);
-    }
+    // 排序 + 取前 N 支
+    stocks.sort((a,b) => mode === "change"
+      ? parseFloat(b.changePct) - parseFloat(a.changePct)
+      : b.volume - a.volume);
     stocks = stocks.slice(0, limit);
 
-    // ── 一次抓所有股票 K 線（Yahoo spark batch）────────────
-    checkDeadline();
-    const stockCodes = stocks.map(s => s.code);
-    const sparkSymbols = stockCodes.map(c => c + ".TW").join(",");
-    let sparkMap = new Map(); // code → history[]
-
-    try {
-      const sparkUrl = `https://query1.finance.yahoo.com/v7/finance/spark?symbols=${encodeURIComponent(sparkSymbols)}&range=6mo&interval=1d`;
-      const sparkRes = await fetchWithTimeout(sparkUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          "Accept": "application/json",
-        }
-      }, 12000);
-      const sparkData = await sparkRes.json();
-      const sparkResult = sparkData?.spark?.result || [];
+    // 處理 spark K 線
+    const sparkMap = new Map();
+    if (sparkRes.status === 'fulfilled') {
+      const sparkResult = sparkRes.value?.spark?.result || [];
       sparkResult.forEach(item => {
         const code = (item.symbol || "").replace(".TW", "");
         const resp = item.response?.[0];
         if (!resp) return;
         const timestamps = resp.timestamp || [];
         const q = resp.indicators?.quote?.[0] || {};
-        const closes  = q.close  || [];
-        const opens   = q.open   || [];
-        const highs   = q.high   || [];
-        const lows    = q.low    || [];
-        const volumes = q.volume || [];
         const hist = timestamps.map((ts, i) => ({
           date:   new Date(ts * 1000).toISOString().split("T")[0],
-          open:   +(opens[i]  || closes[i] || 0).toFixed(2),
-          high:   +(highs[i]  || closes[i] || 0).toFixed(2),
-          low:    +(lows[i]   || closes[i] || 0).toFixed(2),
-          close:  +(closes[i] || 0).toFixed(2),
-          volume: Math.round((volumes[i] || 0) / 1000),
+          open:   +((q.open?.[i]   || q.close?.[i] || 0)).toFixed(2),
+          high:   +((q.high?.[i]   || q.close?.[i] || 0)).toFixed(2),
+          low:    +((q.low?.[i]    || q.close?.[i] || 0)).toFixed(2),
+          close:  +((q.close?.[i]  || 0)).toFixed(2),
+          volume: Math.round((q.volume?.[i] || 0) / 1000),
         })).filter(d => d.close > 0);
         if (hist.length > 0) sparkMap.set(code, hist);
       });
-      console.log(`[scan] spark: ${sparkMap.size}/${stockCodes.length} stocks`);
-    } catch(e) {
-      console.error("[scan] spark error:", e.message);
+      console.log(`[scan] spark: ${sparkMap.size}/${stocks.length}`);
+    } else {
+      console.error("[scan] spark failed:", sparkRes.reason?.message);
     }
-
-    // spark 沒抓到的，從 cache 或逐支補抓（最多 5 支，避免逾時）
-    const missingHist = stocks.filter(s => !sparkMap.has(s.code)).slice(0, 5);
-    for (const s of missingHist) {
-      const cached = getCache(`history:${s.code}:120`);
-      if (cached) { sparkMap.set(s.code, cached); continue; }
-      try {
-        const hist = await getHistory(s.code, 120);
-        if (hist.length) { sparkMap.set(s.code, hist); setCache(`history:${s.code}:120`, hist, CACHE_TTL.history); }
-      } catch(e) {}
-    }
-
     checkDeadline();
 
     // ── 計算指標與評分（純 CPU，無 IO）────────────────────
@@ -1173,7 +1146,7 @@ ${
       },
       body: JSON.stringify({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 1000,
+        max_tokens: 600,
         messages: [{ role: "user", content: prompt }]
       })
     });

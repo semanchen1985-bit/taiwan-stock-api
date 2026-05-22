@@ -109,7 +109,7 @@ app.use((req, res, next) => {
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    version: "2025-v4-yahoo",   // ← 確認版本用
+    version: "2025-v5-chart",   // ← 確認版本用
     time: new Date().toISOString(),
     cache: CACHE.size,
     inFlight: IN_FLIGHT.size,
@@ -146,19 +146,31 @@ app.get("/test-apis", async (req, res) => {
     results.twse = item ? `✅ z=${item.z} y=${item.y}` : "⚠ 無資料";
   } catch(e) { results.twse = "❌ " + e.message; }
 
-  // 3. FinMind
+  // 3. Yahoo Finance chart（getHistory 用）
+  try {
+    const r = await fetchWithTimeout(
+      "https://query1.finance.yahoo.com/v8/finance/chart/2330.TW?interval=1d&range=1mo",
+      { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json" } },
+      8000
+    );
+    const d = await r.json();
+    const closes = d?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [];
+    results.yahooChart = closes.length ? `✅ ${closes.length} 筆K線，最新收盤: ${closes.at(-1)?.toFixed(2)}` : `⚠ 無資料`;
+  } catch(e) { results.yahooChart = "❌ " + e.message; }
+
+  // 4. FinMind（三大法人/融資用）
   try {
     const token = process.env.FINMIND_TOKEN || "";
     const today = new Date().toISOString().split("T")[0];
     const start = new Date(Date.now()-14*24*60*60*1000).toISOString().split("T")[0];
     const r = await fetchWithTimeout(
-      `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=2330&start_date=${start}&end_date=${today}&token=${token}`,
+      `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id=2330&start_date=${start}&end_date=${today}&token=${token}`,
       { headers: { "User-Agent": "Mozilla/5.0" } },
       8000
     );
     const d = await r.json();
     const rows = d?.data || [];
-    results.finmind = rows.length ? `✅ ${rows.length} 筆，最新: ${rows.at(-1)?.close}` : `⚠ 無資料 msg=${d?.msg||""}`;
+    results.finmind = rows.length ? `✅ 三大法人 ${rows.length} 筆，token=${token?"有":"無"}` : `⚠ 無資料 msg=${d?.msg||""} token=${token?"有":"無"}`;
   } catch(e) { results.finmind = "❌ " + e.message; }
 
   res.json({ time: new Date().toISOString(), apis: results });
@@ -219,12 +231,47 @@ app.get("/search", async (req, res) => {
 
 // ── TWSE 即時報價 ─────────────────────────────────────────
 async function getQuote(code) {
-  // 優先用 Yahoo Finance（Render 伺服器能存取，不受地區限制）
+  // Yahoo Finance v8 chart（包含即時行情 + 最近資料）
   try {
-    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${code}.TW`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${code}.TW?interval=1d&range=5d`;
     const r = await fetchWithTimeout(url, {
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json" }
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+      }
     }, 8000);
+    const data = await r.json();
+    const meta = data?.chart?.result?.[0]?.meta;
+    if (meta && meta.regularMarketPrice) {
+      const price  = meta.regularMarketPrice;
+      const prev   = meta.previousClose || meta.chartPreviousClose || price;
+      const change = +(price - prev).toFixed(2);
+      const changePct = prev > 0 ? +((change/prev)*100).toFixed(2) : 0;
+      return {
+        code,
+        name:      meta.shortName || meta.longName || code,
+        price,
+        prev,
+        change,
+        changePct,
+        open:      meta.regularMarketOpen   || price,
+        high:      meta.regularMarketDayHigh|| price,
+        low:       meta.regularMarketDayLow || price,
+        volume:    Math.round((meta.regularMarketVolume || 0) / 1000),
+        market:    "上市",
+        time:      "",
+      };
+    }
+  } catch(e) {}
+
+  // Fallback: Yahoo v7 quote
+  try {
+    const r = await fetchWithTimeout(
+      `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${code}.TW`,
+      { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json" } },
+      6000
+    );
     const data = await r.json();
     const q = (data?.quoteResponse?.result || [])[0];
     if (q && q.regularMarketPrice) {
@@ -233,18 +280,12 @@ async function getQuote(code) {
       const change = +(q.regularMarketChange || 0).toFixed(2);
       const changePct = +((q.regularMarketChangePercent || 0)).toFixed(2);
       return {
-        code,
-        name:      q.shortName || q.longName || code,
-        price,
-        prev,
-        change,
-        changePct,
-        open:      q.regularMarketOpen   || price,
-        high:      q.regularMarketDayHigh|| price,
-        low:       q.regularMarketDayLow || price,
-        volume:    Math.round((q.regularMarketVolume || 0) / 1000),
-        market:    "上市",
-        time:      "",
+        code, name: q.shortName || q.longName || code,
+        price, prev, change, changePct,
+        open: q.regularMarketOpen || price, high: q.regularMarketDayHigh || price,
+        low: q.regularMarketDayLow || price,
+        volume: Math.round((q.regularMarketVolume || 0) / 1000),
+        market: "上市", time: "",
       };
     }
   } catch(e) {}
@@ -252,10 +293,11 @@ async function getQuote(code) {
   // Fallback: TWSE 即時行情
   try {
     for (const mkt of ["tse", "otc"]) {
-      const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${mkt}_${code}.tw&json=1&delay=0`;
-      const r = await fetchWithTimeout(url, {
-        headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" }
-      }, 5000);
+      const r = await fetchWithTimeout(
+        `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${mkt}_${code}.tw&json=1&delay=0`,
+        { headers: { "Referer": "https://mis.twse.com.tw/", "User-Agent": "Mozilla/5.0" } },
+        5000
+      );
       const data = await r.json();
       const item = (data?.msgArray || [])[0];
       if (!item || !item.z || item.z === "-") continue;
@@ -274,7 +316,6 @@ async function getQuote(code) {
   return null;
 }
 
-
 async function getHistoryCached(code, days = 400) {
   const cacheKey = `history:${code}:${days}`;
   const cached = getCache(cacheKey);
@@ -290,20 +331,52 @@ async function getHistoryCached(code, days = 400) {
 }
 
 async function getHistory(code, days = 400) {
+  // 優先用 Yahoo Finance chart（不需 token，全球可存取）
+  try {
+    const range = days <= 120 ? "6mo" : days <= 250 ? "1y" : "2y";
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${code}.TW?interval=1d&range=${range}`;
+    const r = await fetchWithTimeout(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+      }
+    }, 10000);
+    const data = await r.json();
+    const result = data?.chart?.result?.[0];
+    if (!result) throw new Error("no result");
+    const timestamps = result.timestamps || result.timestamp || [];
+    const q = result.indicators?.quote?.[0] || {};
+    const opens   = q.open   || [];
+    const highs   = q.high   || [];
+    const lows    = q.low    || [];
+    const closes  = q.close  || [];
+    const volumes = q.volume || [];
+    if (!closes.length) throw new Error("no closes");
+    return timestamps.map((ts, i) => ({
+      date:   new Date(ts * 1000).toISOString().split("T")[0],
+      open:   +(opens[i]   || closes[i] || 0).toFixed(2),
+      high:   +(highs[i]   || closes[i] || 0).toFixed(2),
+      low:    +(lows[i]    || closes[i] || 0).toFixed(2),
+      close:  +(closes[i]  || 0).toFixed(2),
+      volume: Math.round((volumes[i] || 0) / 1000), // 轉換成張
+    })).filter(d => d.close > 0);
+  } catch(e) {}
+
+  // Fallback: FinMind（需要 token，但有備用）
   try {
     const token = process.env.FINMIND_TOKEN || "";
-    const end = new Date().toISOString().split("T")[0];
+    const end   = new Date().toISOString().split("T")[0];
     const start = new Date(Date.now() - days*24*60*60*1000).toISOString().split("T")[0];
     const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${code}&start_date=${start}&end_date=${end}&token=${token}`;
-    const r = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } }, 8000);
+    const r = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } }, 10000);
     const data = await r.json();
     return (data?.data || []).map(d => ({
-      date: d.date,
-      open: parseFloat(d.open),
-      high: parseFloat(d.max),
-      low:  parseFloat(d.min),
-      close: parseFloat(d.close),
-      volume: parseInt(d.Trading_Volume / 1000) // 轉換成張
+      date:   d.date,
+      open:   parseFloat(d.open),
+      high:   parseFloat(d.max),
+      low:    parseFloat(d.min),
+      close:  parseFloat(d.close),
+      volume: parseInt(d.Trading_Volume / 1000),
     }));
   } catch(e) {}
   return [];

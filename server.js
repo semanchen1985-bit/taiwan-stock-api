@@ -878,9 +878,7 @@ app.post("/analyze",async(req,res)=>{
     const [qR,hR]=await Promise.allSettled([getQuote(code),getHistoryCached(code)]);
     const q=qR.status==="fulfilled"?qR.value:null;
     const hist=hR.status==="fulfilled"?(hR.value||[]):[];
-    const history=hist;         // prompt 相容
-    const fundamentals=fund;    // prompt 相容
-    const revenue=rev;          // prompt 相容
+    const history=hist; // prompt 相容
     if(!q) return res.status(404).json({error:`找不到股票 ${code}`});
     const price=q.price; tick();
 
@@ -890,6 +888,9 @@ app.post("/analyze",async(req,res)=>{
     const margin=mR.status==="fulfilled"?mR.value:null;
     const fund=fR.status==="fulfilled"?fR.value:null;
     const rev=rR.status==="fulfilled"?rR.value:null;
+    // prompt 相容別名（必須在 fund/rev 宣告之後）
+    const fundamentals=fund;
+    const revenue=rev;
 
     const ind=getIndCached(code,hist,price);
     const scored=getScoreCached(code,ind,chip,margin,fund,rev,hist,price);

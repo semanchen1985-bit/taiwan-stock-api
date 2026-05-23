@@ -1050,7 +1050,12 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
     // Claude API timeout → 回傳基本資料（不含 AI 報告）
     const isClaudeTimeout = e.message?.includes("api.anthropic.com");
     if(isClaudeTimeout && q){
-      return res.json({text:"（AI 報告暫時無法產生，請稍後再試）",quote:q,indicators:ind,chip,margin,fundamentals:fund,revenue:rev,scored});
+      return res.json({
+        text:"（AI 報告生成中，請再點一次「分析」按鈕）",
+        quote:q, indicators:ind, chip, margin,
+        fundamentals:fund, revenue:rev, scored,
+        aiPending: true,
+      });
     }
     if(e.message==="analyze_timeout")
       return res.status(503).json({error:"分析逾時，請稍後再試"});

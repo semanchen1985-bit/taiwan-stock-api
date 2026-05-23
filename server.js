@@ -879,8 +879,10 @@ app.post("/analyze",async(req,res)=>{
 
   try{
     tick();
+    const t0=Date.now();
     // critical data 優先
     const [qR,hR]=await Promise.allSettled([getQuote(code),getHistoryCached(code)]);
+    log.info("analyze_step1",{code,ms:Date.now()-t0,q:qR.status,h:hR.status});
     const q=qR.status==="fulfilled"?qR.value:null;
     const hist=hR.status==="fulfilled"?(hR.value||[]):[];
     const history=hist; // prompt 相容
@@ -888,7 +890,9 @@ app.post("/analyze",async(req,res)=>{
     const price=q.price; tick();
 
     // optional data（全部並行，任一失敗繼續）
+    const t1=Date.now();
     const [cR,mR,fR,rR]=await Promise.allSettled([getChip(code),getMargin(code),getFundamentals(code),getRevenue(code)]);
+    log.info("analyze_step2",{code,ms:Date.now()-t1,c:cR.status,m:mR.status,f:fR.status,r:rR.status});
     const chip=cR.status==="fulfilled"?cR.value:null;
     const margin=mR.status==="fulfilled"?mR.value:null;
     const fund=fR.status==="fulfilled"?fR.value:null;
@@ -1046,8 +1050,11 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
 最值得關注的關鍵訊號：`;
 
     tick();
+    const t2=Date.now();
+    log.info("analyze_step3_claude_start",{code,elapsed:Date.now()-t0});
     const aiR=await fetchRetry("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":AK(),"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:2000,messages:[{role:"user",content:prompt}]})},15e3,1);
     const fullText=(await aiR.json()).content?.[0]?.text||"";
+    log.info("analyze_step3_claude_done",{code,ms:Date.now()-t2,chars:fullText.length});
     res.json({text:fullText,quote:q,indicators:ind,chip,margin,fundamentals:fund,revenue:rev,scored});
 
   }catch(e){

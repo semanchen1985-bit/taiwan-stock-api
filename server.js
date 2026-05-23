@@ -228,7 +228,9 @@ async function fetchRetry(url, opts={}, ms=8000, maxRetry=2) {
       cbOk(url); return r;
     } catch(e){ clearTimeout(t); lastErr=e; if(!RETRY_MSGS.some(s=>(e.message||"").includes(s))&&e.name!=="AbortError") break; }
   }
-  cbFail(url); throw lastErr||new Error("fetch_failed");
+  cbFail(url);
+  if (lastErr?.name === "AbortError") throw new Error(`fetch_timeout: ${cbKey(url)}`);
+  throw lastErr || new Error("fetch_failed");
 }
 const fetchWithTimeout=(u,o,ms)=>fetchRetry(u,o,ms,1);
 
@@ -341,7 +343,7 @@ async function getStockList() {
 async function fetchYahooChart(code) {
   return swrFetch(`chart:${code}`,"chart",async()=>{
     const url=`https://query1.finance.yahoo.com/v8/finance/chart/${code}.TW?interval=1d&range=6mo`;
-    const r=await fetchRetry(url,{headers:{"User-Agent":YH,"Accept":"application/json"}},8e3,2);
+    const r=await fetchRetry(url,{headers:{"User-Agent":YH,"Accept":"application/json"}},12e3,2);
     const res=(await r.json())?.chart?.result?.[0];
     if (!res) throw new Error("no_result");
     const meta=res.meta||{},ts=res.timestamp||[],q=res.indicators?.quote?.[0]||{};
@@ -392,7 +394,7 @@ async function getQuote(code) {
 async function getHistory(code,days=400){
   try{
     const range=days<=120?"6mo":days<=250?"1y":"2y";
-    const r=await fetchRetry(`https://query1.finance.yahoo.com/v8/finance/chart/${code}.TW?interval=1d&range=${range}`,{headers:{"User-Agent":YH,"Accept":"application/json"}},10e3,2);
+    const r=await fetchRetry(`https://query1.finance.yahoo.com/v8/finance/chart/${code}.TW?interval=1d&range=${range}`,{headers:{"User-Agent":YH,"Accept":"application/json"}},12e3,2);
     const res=(await r.json())?.chart?.result?.[0]; if(!res)throw new Error();
     const ts=res.timestamp||[],q=res.indicators?.quote?.[0]||{};
     const hist=ts.map((t,i)=>({date:new Date(t*1000).toISOString().split("T")[0],open:+(q.open?.[i]||q.close?.[i]||0).toFixed(2),high:+(q.high?.[i]||q.close?.[i]||0).toFixed(2),low:+(q.low?.[i]||q.close?.[i]||0).toFixed(2),close:+(q.close?.[i]||0).toFixed(2),volume:Math.round((q.volume?.[i]||0)/1000)})).filter(d=>d.close>0);
@@ -1047,7 +1049,8 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
 
   }catch(e){
     log.error("analyze_err",{id:req.id,code,msg:e.message});
-    if(e.message==="analyze_timeout") return res.status(503).json({error:"分析逾時，請稍後再試"});
+    if(e.message==="analyze_timeout"||e.message?.includes("fetch_timeout"))
+      return res.status(503).json({error:"分析逾時，請稍後再試（Render 伺服器冷啟動中，請等 30 秒後重試）"});
     res.status(500).json({error:e.message||"分析失敗"});
   }
 });

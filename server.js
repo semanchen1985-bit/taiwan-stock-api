@@ -789,6 +789,123 @@ app.get("/scan",async(req,res)=>{
 
 
 // ════════════════════════════════════════════════════════
+// 族群對應表（fallback，FinMind 沒有時使用）
+// ════════════════════════════════════════════════════════
+const SECTOR_MAP = {
+  "半導體": ["2330","2303","2454","2379","2344","3034","3711","2408","2337","3533","2449","6770","3443","2351"],
+  "電子組裝": ["2317","2382","2356","2354","2352","3231","2362","2365","4938","3702"],
+  "伺服器/AI": ["2382","3231","6669","6789","3017","2345","5483","6235","3006","2353"],
+  "網通": ["2345","4904","3044","6443","6415","3149","4977","5285","8299","3706"],
+  "PCB": ["3037","2349","8046","3706","6183","3028","6269","2445","3189","3094"],
+  "面板": ["2409","3481","5483","3673","6185","6443"],
+  "光電/LED": ["2448","3014","2393","3703","2455","6244","3035","2340"],
+  "金融": ["2881","2882","2891","2886","2884","2885","2892","2888","2887","2890","5880","2883","2889"],
+  "航運": ["2603","2615","2609","2610","2612","2606","2608","2614","2616","2618"],
+  "鋼鐵": ["2002","2006","2007","2008","2015","9910","2023","2025"],
+  "汽車/電動車": ["2201","2207","1537","1590","6208","2208","1598","2231"],
+  "生技醫療": ["4763","6547","1786","4174","6202","4188","6547","3719","4194","4155"],
+  "電信": ["2412","3045","4904","4977"],
+  "電子零件": ["2327","2385","6116","2399","3189","6269","2492","2475","2321"],
+  "高股息ETF": ["0050","0056","00878","00919","006208","00929","00713","00692"],
+  "電源/被動": ["2308","2474","2492","3045","6121","2425","2327","1736"],
+  "橡塑膠": ["1476","1477","1301","1303","1304","1308","2102","2103"],
+  "食品": ["1201","1203","1210","1213","1215","1216","1218","1219","1220"],
+  "紡織": ["1402","1434","1440","1441","1444","1445","1446","1449"],
+  "建築/營建": ["2395","2534","2535","2536","2537","2538","2543","5522"],
+};
+
+// FinMind industry_category → 我們的族群名稱
+const FM_SECTOR_ALIAS = {
+  "半導體": "半導體", "IC設計": "半導體", "晶圓代工": "半導體",
+  "電腦及週邊設備": "電子組裝", "電子零組件": "電子零件",
+  "光電業": "光電/LED", "通信網路業": "網通",
+  "金融業": "金融", "銀行業": "金融", "保險業": "金融", "證券業": "金融",
+  "航運業": "航運", "鋼鐵工業": "鋼鐵", "汽車工業": "汽車/電動車",
+  "生技醫療業": "生技醫療", "食品工業": "食品", "紡織纖維": "紡織",
+  "建材營造": "建築/營建", "橡膠工業": "橡塑膠",
+};
+
+// 取得股票所屬族群（優先 FinMind，否則用 fallback）
+function getSector(code, fmCategory) {
+  if (fmCategory) {
+    const alias = FM_SECTOR_ALIAS[fmCategory];
+    if (alias) return alias;
+    // 直接用 FinMind 分類
+    return fmCategory;
+  }
+  for (const [sec, codes] of Object.entries(SECTOR_MAP)) {
+    if (codes.includes(code)) return sec;
+  }
+  return "其他";
+}
+
+// ── 族群熱度計算（0~100）──────────────────────────────
+function calcSectorHeat(stocks) {
+  const n = stocks.length;
+  if (!n) return 0;
+  let score = 0;
+
+  // 1. 族群平均漲幅（25分）
+  const avgChg = stocks.reduce((s,st)=>s+(parseFloat(st.changePct)||0),0)/n;
+  if (avgChg >= 3)       score += 25;
+  else if (avgChg >= 2)  score += 20;
+  else if (avgChg >= 1)  score += 14;
+  else if (avgChg >= 0)  score += 7;
+  else if (avgChg >= -1) score += 2;
+
+  // 2. 上漲家數比例（20分）
+  const upCount = stocks.filter(s=>(parseFloat(s.changePct)||0)>0).length;
+  const upRatio = upCount / n;
+  if (upRatio >= 0.8)       score += 20;
+  else if (upRatio >= 0.6)  score += 15;
+  else if (upRatio >= 0.4)  score += 8;
+  else if (upRatio >= 0.2)  score += 3;
+
+  // 3. 族群成交金額（20分）—— 相對分，由外部正規化
+  // 暫用成交量總和代替
+  const totalVol = stocks.reduce((s,st)=>s+(st.volume||0),0);
+  const avgVol   = totalVol / n;
+  if (avgVol >= 5000)      score += 20;
+  else if (avgVol >= 2000) score += 15;
+  else if (avgVol >= 500)  score += 8;
+  else if (avgVol >= 100)  score += 3;
+
+  // 4. 爆量比例（15分）
+  const hotCount = stocks.filter(s=>s._volRatio && s._volRatio >= 1.5).length;
+  const hotRatio = hotCount / n;
+  if (hotRatio >= 0.5)      score += 15;
+  else if (hotRatio >= 0.3) score += 10;
+  else if (hotRatio >= 0.1) score += 5;
+
+  // 5. 族群內動能股數量（10分）
+  const momCount = stocks.filter(s=>(s.momentumScore||0) >= 60).length;
+  if (momCount >= 5)       score += 10;
+  else if (momCount >= 3)  score += 7;
+  else if (momCount >= 1)  score += 3;
+
+  // 6. 法人買超（10分）
+  const instCount = stocks.filter(s=>s._chip&&((s._chip.foreign1>0)||(s._chip.site1>0))).length;
+  const instRatio = instCount / n;
+  if (instRatio >= 0.5)      score += 10;
+  else if (instRatio >= 0.3) score += 6;
+  else if (instRatio >= 0.1) score += 2;
+
+  return Math.min(100, Math.round(score));
+}
+
+// ── 族群標籤 ──────────────────────────────────────────
+function getSectorTags(sectorData, sectorRank, totalSectors) {
+  const tags = [];
+  if (sectorData.sectorHeat >= 80) tags.push({text:"🔥 主流族群",cls:"hot"});
+  if (sectorRank < 5)              tags.push({text:"💰 資金集中",cls:"hot"});
+  if (sectorData.hotRatio >= 0.3)  tags.push({text:"🚀 族群爆量",cls:"bull"});
+  if (sectorData.upRatio  >= 0.6)  tags.push({text:"📈 多數轉強",cls:"bull"});
+  if (sectorData.instRatio >= 0.3) tags.push({text:"🏦 法人布局",cls:"bull"});
+  return tags;
+}
+
+
+// ════════════════════════════════════════════════════════
 // 動能全市場掃描（大池子專用）
 // ════════════════════════════════════════════════════════
 async function _runMomentumScan(poolCodes, limit, cacheKey) {
@@ -864,6 +981,149 @@ async function _runMomentumScan(poolCodes, limit, cacheKey) {
   return resp;
 }
 
+
+// ════════════════════════════════════════════════════════
+// 族群熱度掃描
+// ════════════════════════════════════════════════════════
+async function _runSectorScan(poolCodes, limit, cacheKey) {
+  const t0 = Date.now();
+  log.info("sector_scan_start", { pool: poolCodes.length });
+
+  // 1. 批次抓 Yahoo chart（concurrency=5）
+  const BATCH = 50;
+  const allStocks = [];
+
+  // 同時取 FinMind 股票清單（含 industry_category）
+  let fmCategoryMap = {};
+  try {
+    const fmList = await getStockList();
+    fmList.forEach(s => { if (s.type) fmCategoryMap[s.code] = s.type; });
+  } catch(e) {}
+
+  for (let i = 0; i < poolCodes.length; i += BATCH) {
+    if (Date.now() - t0 > 50000) {
+      log.warn("sector_scan_timeout", { scanned: i });
+      break;
+    }
+    const batch = poolCodes.slice(i, i + BATCH);
+    const tasks = batch.map(code => async () => {
+      try {
+        const r = await fetchYahooChart(code);
+        if (!r?.stock?.price) return null;
+        const hist = r.hist || [];
+        const ind  = calcIndicators(hist, r.stock.price);
+        const chip = cacheGet(`chip:${code}`).fresh || cacheGet(`chip:${code}`).stale;
+        const ms   = calcMomentumScore(ind, chip, hist, r.stock);
+        const mt   = getMomentumTags(ind, chip, hist, r.stock);
+
+        // 計算成交量倍數
+        const vol5avg = hist.length >= 5
+          ? hist.slice(-6,-1).reduce((s,h)=>s+(h.volume||0),0)/5 : 0;
+        const volRatio = vol5avg > 0 ? r.stock.volume / vol5avg : 0;
+
+        // 取得族群
+        const fmCat = fmCategoryMap[code];
+        const sector = getSector(code, fmCat);
+
+        return {
+          ...r.stock,
+          momentumScore: ms,
+          momentumTags: mt,
+          sector,
+          _volRatio: volRatio,
+          _chip: chip,
+          rsi: ind.rsi,
+          maTrend: ind.maTrend,
+        };
+      } catch(e) { return null; }
+    });
+
+    const results = await runLimited(tasks, 5);
+    results.forEach(s => { if (s) allStocks.push(s); });
+  }
+
+  log.info("sector_scan_fetched", { stocks: allStocks.length, ms: Date.now()-t0 });
+
+  // 2. 依族群分組
+  const sectorGroups = {};
+  allStocks.forEach(s => {
+    if (!sectorGroups[s.sector]) sectorGroups[s.sector] = [];
+    sectorGroups[s.sector].push(s);
+  });
+
+  // 3. 計算每族群熱度
+  const sectorList = [];
+  for (const [sector, stocks] of Object.entries(sectorGroups)) {
+    if (stocks.length < 2) continue; // 太少股票的族群跳過
+    const n = stocks.length;
+    const avgChg     = stocks.reduce((s,st)=>s+(parseFloat(st.changePct)||0),0)/n;
+    const upCount    = stocks.filter(s=>(parseFloat(s.changePct)||0)>0).length;
+    const upRatio    = upCount/n;
+    const hotCount   = stocks.filter(s=>s._volRatio>=1.5).length;
+    const hotRatio   = hotCount/n;
+    const instCount  = stocks.filter(s=>s._chip&&((s._chip.foreign1>0)||(s._chip.site1>0))).length;
+    const instRatio  = instCount/n;
+    const totalVol   = stocks.reduce((s,st)=>s+(st.volume||0),0);
+    const sectorHeat = calcSectorHeat(stocks);
+
+    // 族群內強勢股（按 momentumScore 排序取前 5）
+    const leaders = [...stocks]
+      .sort((a,b)=>b.momentumScore-a.momentumScore)
+      .slice(0,5)
+      .map(s=>({code:s.code,name:s.name,price:s.price,
+        changePct:s.changePct,momentumScore:s.momentumScore,
+        momentumTags:s.momentumTags}));
+
+    sectorList.push({
+      sector, sectorHeat, avgChangePct: +avgChg.toFixed(2),
+      upRatio: +upRatio.toFixed(2), hotRatio: +hotRatio.toFixed(2),
+      instRatio: +instRatio.toFixed(2), totalVol, stockCount: n, leaders,
+    });
+  }
+
+  // 4. 族群按熱度排序
+  sectorList.sort((a,b)=>b.sectorHeat-a.sectorHeat);
+  const topSectors = sectorList.slice(0,10).map((sd,i)=>({
+    ...sd, tags: getSectorTags(sd, i, sectorList.length),
+  }));
+
+  // 5. 全市場前 50 強股（按 momentumScore）
+  const top50 = [...allStocks]
+    .sort((a,b)=>b.momentumScore-a.momentumScore)
+    .slice(0, limit)
+    .map(s=>({
+      code:s.code, name:s.name, price:s.price,
+      changePct:s.changePct, momentumScore:s.momentumScore,
+      momentumTags:s.momentumTags, sector:s.sector,
+    }));
+
+  // 6. Claude AI 族群分析（optional）
+  let aiComment = "";
+  if (AK() && topSectors.length > 0) {
+    try {
+      const prompt = `你是台股職業交易員，以下是今日台股族群熱度排行，請用2句話點評目前市場主流族群與操作重點：\n${
+        topSectors.slice(0,5).map(s=>`${s.sector} 熱度${s.sectorHeat}分 平均漲幅${s.avgChangePct}% 上漲比例${Math.round(s.upRatio*100)}%`).join("\n")
+      }`;
+      const aiRes = await fetchRetry("https://api.anthropic.com/v1/messages",{
+        method:"POST",
+        headers:{"Content-Type":"application/json","x-api-key":AK(),"anthropic-version":"2023-06-01"},
+        body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:200,
+          messages:[{role:"user",content:prompt}]}),
+      }, 10000, 1);
+      aiComment = (await aiRes.json()).content?.[0]?.text || "";
+    } catch(e) {}
+  }
+
+  log.info("sector_scan_done", { sectors: topSectors.length, top50: top50.length, ms: Date.now()-t0 });
+
+  const resp = {
+    mode:"sector", stocks: top50, sectors: topSectors,
+    aiComment, time: new Date().toISOString(), _v:"sector",
+  };
+  cacheSet(cacheKey, resp, TTL.scan);
+  return resp;
+}
+
 async function _runScan(mode,limit,cacheKey,universe="custom"){
   const dl=Date.now()+55000;const tick=()=>{if(Date.now()>dl)throw new Error("scan_timeout");};
 
@@ -887,6 +1147,10 @@ async function _runScan(mode,limit,cacheKey,universe="custom"){
     poolCodes=SCAN_STOCKS.map(s=>s.code);
   }
 
+  // sector → 族群熱度掃描
+  if(mode==="sector"){
+    return await _runSectorScan(poolCodes,limit,cacheKey);
+  }
   // momentum + 大池子 → 走專用流程
   if(mode==="momentum"&&universe!=="custom"){
     return await _runMomentumScan(poolCodes,limit,cacheKey);

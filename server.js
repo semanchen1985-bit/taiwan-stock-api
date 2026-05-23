@@ -238,7 +238,19 @@ async function getStockList(){
   const tok=FT();
   if(tok){try{
     const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},10e3,1);
-    const list=(await r.json())?.data?.filter(s=>s.stock_id&&s.stock_name).map(s=>({code:s.stock_id,name:s.stock_name,type:s.type||""}));
+    const raw=(await r.json())?.data||[];
+    // 去重（同代號只保留中文名稱）+ 加 industry_category
+    const seen=new Set();
+    const list=raw.filter(s=>s.stock_id&&s.stock_name).filter(s=>{
+      if(seen.has(s.stock_id))return false;
+      // 有中文名稱的優先，英文重複的跳過
+      seen.add(s.stock_id); return true;
+    }).map(s=>({
+      code: s.stock_id,
+      name: s.stock_name,
+      type: s.type||"",
+      industry: s.industry_category||"", // 真正的產業分類
+    }));
     if(list?.length>100){_sL=list;_sLts=Date.now();return list;}
   }catch(e){}}
   if(!_sL)_sL=BUILTIN_STOCK_LIST;
@@ -827,10 +839,10 @@ const FM_SECTOR_ALIAS = {
 
 // 取得股票所屬族群（優先 FinMind，否則用 fallback）
 function getSector(code, fmCategory) {
-  if (fmCategory) {
+  // type 欄位（twse/otc）不是族群，要忽略
+  if (fmCategory && fmCategory !== "twse" && fmCategory !== "otc" && fmCategory.length > 3) {
     const alias = FM_SECTOR_ALIAS[fmCategory];
     if (alias) return alias;
-    // 直接用 FinMind 分類
     return fmCategory;
   }
   for (const [sec, codes] of Object.entries(SECTOR_MAP)) {
@@ -997,7 +1009,7 @@ async function _runSectorScan(poolCodes, limit, cacheKey) {
   let fmCategoryMap = {};
   try {
     const fmList = await getStockList();
-    fmList.forEach(s => { if (s.type) fmCategoryMap[s.code] = s.type; });
+    fmList.forEach(s => { if (s.industry) fmCategoryMap[s.code] = s.industry; });
   } catch(e) {}
 
   for (let i = 0; i < poolCodes.length; i += BATCH) {
@@ -1132,8 +1144,11 @@ async function _runScan(mode,limit,cacheKey,universe="custom"){
   if(universe==="all"||universe==="large"){
     try{
       const all=await getStockList();
+      const _seenPool=new Set();
       poolCodes=all.map(s=>s.code).filter(c=>{
         if(!/^\d+$/.test(c))return false;
+        if(_seenPool.has(c))return false;
+        _seenPool.add(c);
         const n=parseInt(c);
         if(universe==="large")return c.length===4&&n>=1000&&n<=9999;
         return c.length<=5;
@@ -1154,7 +1169,12 @@ async function _runScan(mode,limit,cacheKey,universe="custom"){
     if(sectorPool.length < 100){
       try{
         const all=await getStockList();
-        sectorPool=all.map(s=>s.code).filter(c=>/^\d{4}$/.test(c)&&parseInt(c)>=1000&&parseInt(c)<=9999);
+        const seenSector=new Set();
+        sectorPool=all.map(s=>s.code).filter(c=>{
+          if(!/^\d{4}$/.test(c)||seenSector.has(c))return false;
+          seenSector.add(c);
+          return parseInt(c)>=1000&&parseInt(c)<=9999;
+        });
         log.info("sector_force_large",{pool:sectorPool.length});
       }catch(e){ sectorPool=poolCodes; }
     }

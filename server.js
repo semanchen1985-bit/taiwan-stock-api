@@ -1053,7 +1053,7 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
     tick();
     const t2=Date.now();
     log.info("analyze_step3_claude_start",{code,elapsed:Date.now()-t0});
-    const aiR=await fetchRetry("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":AK(),"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:2000,messages:[{role:"user",content:prompt}]})},50e3,0);
+    const aiR=await fetchRetry("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":AK(),"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:4000,messages:[{role:"user",content:prompt}]})},50e3,0);
     const aiJson = await aiR.json();
     const fullText = aiJson.content?.[0]?.text || "";
     log.info("analyze_step3_claude_done",{code,ms:Date.now()-t2,chars:fullText.length});

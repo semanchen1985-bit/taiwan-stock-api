@@ -1,348 +1,257 @@
 "use strict";
-// ══════════════════════════════════════════════════════════
-// 台股AI分析後端 server.js — production v11
-// Node.js 18+ | Express 4
-// ══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// 台股AI分析後端  server.js  production v11
+// Node.js 18+  |  Express 4  |  Render-safe
+// ═══════════════════════════════════════════════════════════
 const express     = require("express");
 const compression = require("compression");
 const helmet      = require("helmet");
 const crypto      = require("crypto");
 const app         = express();
 
-// ── Trust Proxy (Render/Heroku) ───────────────────────────
 app.set("trust proxy", 1);
-app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+app.use(helmet({ contentSecurityPolicy:false, crossOriginEmbedderPolicy:false }));
 app.use(compression());
-app.use(express.json({ limit: "10kb" }));
+app.use(express.json({ limit:"10kb" }));
 
-// ══════════════════════════════════════════════════════════
-// CONFIG
-// ══════════════════════════════════════════════════════════
-const PORT        = process.env.PORT        || 3001;
-const AK          = () => process.env.ANTHROPIC_API_KEY || "";
-const FT          = () => process.env.FINMIND_TOKEN     || "";
-const ADMIN_TK    = process.env.ADMIN_TOKEN             || "";
-const ORIGINS     = (process.env.ALLOWED_ORIGINS || "")
-  .split(",").map(s => s.trim()).filter(Boolean);
+// ── 環境 ────────────────────────────────────────────────
+const PORT      = process.env.PORT        || 3001;
+const AK        = () => process.env.ANTHROPIC_API_KEY || "";
+const FT        = () => process.env.FINMIND_TOKEN     || "";
+const ADMIN_TK  = process.env.ADMIN_TOKEN             || "";
+const EXT_ORIG  = (process.env.ALLOWED_ORIGINS || "")
+                   .split(",").map(s=>s.trim()).filter(Boolean);
 
-// ══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // STRUCTURED LOGGER
-// ══════════════════════════════════════════════════════════
-const LOG_LEVEL = { DEBUG:0, INFO:1, WARN:2, ERROR:3 };
-const CURRENT_LEVEL = LOG_LEVEL[process.env.LOG_LEVEL?.toUpperCase() || "INFO"] ?? 1;
-
-function _log(lvl, msg, meta = {}) {
-  if (LOG_LEVEL[lvl] < CURRENT_LEVEL) return;
-  const line = JSON.stringify({
-    ts:  new Date().toISOString(),
-    lvl, msg,
-    pid: process.pid,
-    mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-    ...meta,
-  });
-  lvl === "ERROR" ? console.error(line) : console.log(line);
-}
+// ═══════════════════════════════════════════════════════════
+const LOG_LEVELS = { DEBUG:0, INFO:1, WARN:2, ERROR:3 };
+const LOG_MIN    = LOG_LEVELS[(process.env.LOG_LEVEL||"INFO").toUpperCase()] ?? 1;
+const _log = (lvl, msg, meta={}) => {
+  if (LOG_LEVELS[lvl] < LOG_MIN) return;
+  const line = JSON.stringify({ ts:new Date().toISOString(), lvl, msg,
+    pid:process.pid, mem:Math.round(process.memoryUsage().heapUsed/1024/1024), ...meta });
+  (lvl==="ERROR"||lvl==="WARN" ? console.error : console.log)(line);
+};
 const log = {
-  debug: (msg, m) => _log("DEBUG", msg, m),
-  info:  (msg, m) => _log("INFO",  msg, m),
-  warn:  (msg, m) => _log("WARN",  msg, m),
-  error: (msg, m) => _log("ERROR", msg, m),
+  debug: (msg,m) => _log("DEBUG",msg,m),
+  info:  (msg,m) => _log("INFO", msg,m),
+  warn:  (msg,m) => _log("WARN", msg,m),
+  error: (msg,m) => _log("ERROR",msg,m),
 };
 
-// ══════════════════════════════════════════════════════════
-// REQUEST MIDDLEWARE — id + latency + access log
-// ══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// REQUEST MIDDLEWARE  — id + latency + access log
+// ═══════════════════════════════════════════════════════════
 app.use((req, res, next) => {
-  req.id    = crypto.randomUUID().slice(0, 8);
-  req.start = Date.now();
+  req.id    = crypto.randomUUID().slice(0,8);
+  req.t0    = Date.now();
   res.on("finish", () => {
-    if (req.path === "/health") return; // 不 log health check
-    log.info("request", {
-      id:      req.id,
-      method:  req.method,
-      path:    req.path,
-      status:  res.statusCode,
-      ms:      Date.now() - req.start,
-      ip:      req.ip,
-    });
+    if (req.path==="/health") return;
+    log.info("req", { id:req.id, m:req.method, p:req.path,
+      s:res.statusCode, ms:Date.now()-req.t0, ip:req.ip });
   });
   next();
 });
 
-// ── CORS ─────────────────────────────────────────────────
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
-  .split(",").map(s => s.trim()).filter(Boolean);
+// ── CORS ────────────────────────────────────────────────
 app.use((req, res, next) => {
-  const origin = req.headers.origin || "";
-  const ok = !origin
-    || origin.includes("localhost") || origin.includes("127.0.0.1")
-    || origin.endsWith(".netlify.app") || origin.endsWith(".github.io")
-    || ALLOWED_ORIGINS.some(o => origin.includes(o));
+  const o = req.headers.origin || "";
+  const ok = !o || o.includes("localhost") || o.includes("127.0.0.1")
+    || o.endsWith(".netlify.app") || o.endsWith(".github.io")
+    || EXT_ORIG.some(x => o.includes(x));
   if (ok) {
-    res.header("Access-Control-Allow-Origin",  origin || "*");
+    res.header("Access-Control-Allow-Origin",  o||"*");
     res.header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token");
     res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   }
-  if (req.method === "OPTIONS") return res.sendStatus(200);
+  if (req.method==="OPTIONS") return res.sendStatus(200);
   next();
 });
 
-// ── GLOBAL TIMEOUT MIDDLEWARE ─────────────────────────────
-// Render 免費版 30s hard limit；給請求 28s budget
+// ── GLOBAL TIMEOUT BUDGET ───────────────────────────────
+// Render 免費版 30s limit；每個請求 28s budget
 app.use((req, res, next) => {
-  if (req.path === "/health" || req.path === "/cache-stats") return next();
+  if (req.path==="/health"||req.path==="/cache-stats") return next();
   req.deadline = Date.now() + 28000;
-  req.tick = () => {
-    if (Date.now() > req.deadline) {
-      const err = new Error("request_timeout");
-      err.status = 503;
-      throw err;
-    }
-  };
+  req.tick = () => { if (Date.now()>req.deadline) { const e=new Error("timeout"); e.status=503; throw e; } };
   next();
 });
 
-// ── OVERLOAD SHEDDING ────────────────────────────────────
-const MAX_INFLIGHT = 15; // Render 免費版單 instance，限制並發
+// ── OVERLOAD SHEDDING ───────────────────────────────────
+const MAX_INFLIGHT = 15;
 let _inflight = 0;
 app.use((req, res, next) => {
-  if (req.path === "/health") return next();
+  if (req.path==="/health") return next();
   if (_inflight >= MAX_INFLIGHT) {
-    log.warn("overload shed", { path: req.path, inflight: _inflight });
-    return res.status(503).json({ error: "伺服器繁忙，請稍後再試" });
+    log.warn("shed", { path:req.path, n:_inflight });
+    return res.status(503).json({ error:"伺服器繁忙，請稍後再試" });
   }
   _inflight++;
-  res.on("finish",  () => _inflight--);
-  res.on("close",   () => _inflight--);
+  const done = () => { _inflight = Math.max(0, _inflight-1); };
+  res.on("finish", done); res.on("close", done);
   next();
 });
 
-// ══════════════════════════════════════════════════════════
-// CACHE — Stale-While-Revalidate + Memory Safe
-// ══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// CACHE  —  SWR + memory-safe FIFO + sweep
+// ═══════════════════════════════════════════════════════════
 const CACHE     = new Map();
 const CACHE_MAX = 450;
 const TTL = {
-  chart: 10*60e3, history: 10*60e3, chip: 30*60e3, margin: 30*60e3,
-  fundamentals: 6*3600e3, revenue: 12*3600e3, scan: 5*60e3,
-  stocklist: 24*3600e3, indicator: 8*60e3, score: 8*60e3,
+  chart:10*60e3, history:10*60e3, chip:30*60e3, margin:30*60e3,
+  fundamentals:6*3600e3, revenue:12*3600e3, scan:5*60e3,
+  stocklist:24*3600e3, indicator:8*60e3, score:8*60e3,
 };
 
-// stable price rounding（防止 cache key 爆炸）
-function stablePrice(p) { return Math.round(parseFloat(p || 0) * 10) / 10; }
+// stable price（防 key cardinality 爆炸）
+const stableP = p => Math.round(parseFloat(p||0)*10)/10;
 
 function cacheGet(key) {
   const e = CACHE.get(key);
-  if (!e) return { fresh: null, stale: null };
-  const age = Date.now() - e.ts;
-  if (age <= e.ttl)     return { fresh: e.data, stale: null };
-  if (age <= e.ttl * 3) return { fresh: null, stale: e.data }; // SWR grace window
-  CACHE.delete(key);    return { fresh: null, stale: null };
+  if (!e) return { fresh:null, stale:null };
+  const age = Date.now()-e.ts;
+  if (age<=e.ttl)     return { fresh:e.data, stale:null };
+  if (age<=e.ttl*3)   return { fresh:null, stale:e.data }; // SWR grace
+  CACHE.delete(key);  return { fresh:null, stale:null };
 }
 function cacheSet(key, data, ttl) {
-  CACHE.delete(key); // maintain insertion order
-  CACHE.set(key, { data, ts: Date.now(), ttl });
+  CACHE.delete(key);                   // maintain insertion order
+  CACHE.set(key, { data, ts:Date.now(), ttl });
   if (CACHE.size > CACHE_MAX) CACHE.delete(CACHE.keys().next().value);
 }
 
-// 定期清理過期 + symbol-aware pruning
+// 定期 sweep：清過期 + memory pressure prune
 setInterval(() => {
-  const now = Date.now();
-  let pruned = 0;
-  for (const [k, e] of CACHE) {
-    if (now - e.ts > e.ttl * 3) { CACHE.delete(k); pruned++; }
+  const now=Date.now(); let pruned=0;
+  for (const [k,e] of CACHE) if (now-e.ts>e.ttl*3){ CACHE.delete(k); pruned++; }
+  const mb = process.memoryUsage().heapUsed/1024/1024;
+  if (mb>280 && CACHE.size>50) {
+    const target = Math.floor(CACHE.size*0.5); let rm=0;
+    for (const k of CACHE.keys()){ if(rm>=target)break; CACHE.delete(k); rm++; }
+    log.warn("mem_prune", { mb:Math.round(mb), rm, left:CACHE.size });
   }
-  // memory pressure（> 280MB 強制清理一半）
-  const mb = process.memoryUsage().heapUsed / 1024 / 1024;
-  if (mb > 280 && CACHE.size > 50) {
-    const target = Math.floor(CACHE.size * 0.5);
-    let removed  = 0;
-    for (const k of CACHE.keys()) {
-      if (removed >= target) break;
-      CACHE.delete(k); removed++;
-    }
-    log.warn("memory prune", { heapMB: Math.round(mb), removed, cacheNow: CACHE.size });
-  }
-  if (pruned > 0) log.debug("cache sweep", { pruned, size: CACHE.size });
+  if (pruned>0) log.debug("sweep", { pruned, size:CACHE.size });
 }, 30000);
 
-// ══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // IN-FLIGHT DEDUPE
-// ══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 const IN_FLIGHT = new Map();
 function dedupe(key, fn) {
   if (IN_FLIGHT.has(key)) return IN_FLIGHT.get(key);
   const p = fn()
-    .then(v  => { IN_FLIGHT.delete(key); return v;  })
-    .catch(e => { IN_FLIGHT.delete(key); throw e; });
-  IN_FLIGHT.set(key, p);
-  return p;
+    .then(v=>{ IN_FLIGHT.delete(key); return v; })
+    .catch(e=>{ IN_FLIGHT.delete(key); throw e; });
+  IN_FLIGHT.set(key, p); return p;
 }
 
-// stale-while-revalidate helper（背景 refresh，不等待）
-function swrFetch(key, ttlName, fetchFn) {
+// SWR helper：fresh → return; stale → return + bg refresh; miss → fetch
+function swrFetch(key, ttlName, fn) {
   const { fresh, stale } = cacheGet(key);
-  if (fresh !== null) return Promise.resolve(fresh);
-  if (stale !== null) {
-    // 背景 refresh，不阻塞
-    setImmediate(() =>
-      dedupe(`bg:${key}`, () => fetchFn()
-        .then(d  => { if (d != null) cacheSet(key, d, TTL[ttlName]); return d; })
-        .catch(() => null)
-      )
-    );
+  if (fresh!==null) return Promise.resolve(fresh);
+  if (stale!==null) {
+    setImmediate(() => dedupe(`bg:${key}`, () =>
+      fn().then(d=>{ if(d!=null) cacheSet(key,d,TTL[ttlName]); return d; }).catch(()=>null)
+    ));
     return Promise.resolve(stale);
   }
-  return dedupe(key, () => fetchFn().then(d => { if (d != null) cacheSet(key, d, TTL[ttlName]); return d; }));
+  return dedupe(key, () => fn().then(d=>{ if(d!=null) cacheSet(key,d,TTL[ttlName]); return d; }));
 }
 
-// ══════════════════════════════════════════════════════════
-// RATE LIMITER — bounded LRU
-// ══════════════════════════════════════════════════════════
-const RATE_MAP  = new Map();
-const RATE_MAX  = 1500;
-function rateLimit(ip, max, windowMs) {
-  const now  = Date.now();
-  const reqs = (RATE_MAP.get(ip) || []).filter(t => now - t < windowMs);
-  reqs.push(now);
-  RATE_MAP.delete(ip); RATE_MAP.set(ip, reqs);
-  if (RATE_MAP.size > RATE_MAX) RATE_MAP.delete(RATE_MAP.keys().next().value);
-  return reqs.length > max;
+// ═══════════════════════════════════════════════════════════
+// RATE LIMITER  —  bounded LRU
+// ═══════════════════════════════════════════════════════════
+const RATE_MAP = new Map(); const RATE_MAX = 1500;
+function rateLimit(ip, max, win) {
+  const now=Date.now(), reqs=(RATE_MAP.get(ip)||[]).filter(t=>now-t<win);
+  reqs.push(now); RATE_MAP.delete(ip); RATE_MAP.set(ip,reqs);
+  if (RATE_MAP.size>RATE_MAX) RATE_MAP.delete(RATE_MAP.keys().next().value);
+  return reqs.length>max;
 }
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of RATE_MAP)
-    if (!v.length || now - v.at(-1) > 120e3) RATE_MAP.delete(k);
-}, 5 * 60e3);
+setInterval(()=>{ const now=Date.now(); for(const[k,v]of RATE_MAP) if(!v.length||now-v.at(-1)>120e3) RATE_MAP.delete(k); }, 5*60e3);
 
-// ══════════════════════════════════════════════════════════
-// CIRCUIT BREAKER — half-open + rolling window + gradual reopen
-// ══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// CIRCUIT BREAKER  —  half-open + rolling window + jitter + gradual
+// ═══════════════════════════════════════════════════════════
 const CB_MAP = new Map();
-const CB = {
-  threshold:    5,    // fails in window → open
-  windowMs:     60e3, // rolling window
-  openMs:       30e3, // base open duration
-  halfMs:       5e3,  // half-open probe interval
-  successNeeded:2,    // successes to fully close
-};
+const CB_CFG = { threshold:5, winMs:60e3, baseOpenMs:30e3, maxOpenMs:300e3, probeMs:5e3, needOk:2 };
 
-function cbKey(url) {
-  try { return new URL(url).hostname; } catch { return url.slice(0, 40); }
-}
-function cbCheck(url) {
-  const k = cbKey(url), s = CB_MAP.get(k);
-  if (!s) return true; // closed
-  const now = Date.now();
-  // jitter reopen（避免雷群效應）
-  const jitter = Math.random() * 5000;
-  if (now < s.openUntil + jitter) return false; // open
-  if (!s.halfProbe || now > s.halfProbe + CB.halfMs) {
-    s.halfProbe = now;
-    return true; // half-open probe
+function cbKey(url) { try{return new URL(url).hostname;}catch{return url.slice(0,40);} }
+function cbAllow(url) {
+  const k=cbKey(url), s=CB_MAP.get(k); if(!s) return true;
+  const now=Date.now();
+  if (now<s.openUntil) {
+    // half-open probe（每 probeMs 允許一次試探）
+    if (!s.probeAt || now-s.probeAt>CB_CFG.probeMs) { s.probeAt=now; return true; }
+    return false;
   }
-  return false;
+  CB_MAP.delete(k); return true;
 }
 function cbFail(url) {
-  const k = cbKey(url);
-  const s = CB_MAP.get(k) || { fails: [], openUntil: 0, successes: 0, halfProbe: 0 };
-  const now = Date.now();
-  s.fails = s.fails.filter(t => now - t < CB.windowMs);
-  s.fails.push(now);
-  s.successes = 0;
-  if (s.fails.length >= CB.threshold) {
-    // 指數增加 open 時間（最多 5 分鐘）
-    const prev = s.openUntil > now ? s.openUntil - now : 0;
-    s.openUntil = now + Math.min(CB.openMs * Math.pow(2, Math.floor(s.fails.length / CB.threshold) - 1), 300e3);
-    log.warn("circuit open", { host: k, fails: s.fails.length, openMs: s.openUntil - now });
+  const k=cbKey(url), now=Date.now();
+  const s=CB_MAP.get(k)||{ fails:[], openUntil:0, okCount:0, openCount:0 };
+  s.fails=s.fails.filter(t=>now-t<CB_CFG.winMs); s.fails.push(now); s.okCount=0;
+  if (s.fails.length>=CB_CFG.threshold) {
+    s.openCount=(s.openCount||0)+1;
+    // 指數退避 open 時長 + jitter
+    const base=Math.min(CB_CFG.baseOpenMs*Math.pow(2,s.openCount-1),CB_CFG.maxOpenMs);
+    s.openUntil=now+base+Math.random()*5000;
+    log.warn("cb_open",{host:k,fails:s.fails.length,openMs:Math.round(s.openUntil-now)});
   }
-  CB_MAP.set(k, s);
+  CB_MAP.set(k,s);
 }
-function cbSuccess(url) {
-  const k = cbKey(url), s = CB_MAP.get(k);
-  if (!s) return;
-  s.successes = (s.successes || 0) + 1;
-  if (s.successes >= CB.successNeeded) {
-    CB_MAP.delete(k);
-    log.info("circuit closed", { host: k });
-  } else { CB_MAP.set(k, s); }
+function cbOk(url) {
+  const k=cbKey(url), s=CB_MAP.get(k); if(!s) return;
+  s.okCount=(s.okCount||0)+1;
+  if (s.okCount>=CB_CFG.needOk) { CB_MAP.delete(k); log.info("cb_closed",{host:k}); }
+  else CB_MAP.set(k,s);
 }
 
-// ══════════════════════════════════════════════════════════
-// FETCH — retry + backoff + circuit breaker
-// ══════════════════════════════════════════════════════════
-const RETRY_HTTP  = new Set([429, 500, 502, 503, 504]);
-const RETRY_ERRS  = ["ECONNRESET","ECONNREFUSED","ETIMEDOUT","socket hang up","fetch failed","AbortError"];
+// ═══════════════════════════════════════════════════════════
+// FETCH  —  retry + backoff + circuit
+// ═══════════════════════════════════════════════════════════
+const RETRY_STATUS = new Set([429,500,502,503,504]);
+const RETRY_MSGS   = ["ECONNRESET","ECONNREFUSED","ETIMEDOUT","socket hang up","fetch failed"];
 
-async function fetchRetry(url, opts = {}, timeoutMs = 8000, maxRetries = 2) {
-  if (!cbCheck(url)) throw new Error(`cb:open:${cbKey(url)}`);
+async function fetchRetry(url, opts={}, ms=8000, maxRetry=2) {
+  if (!cbAllow(url)) throw new Error(`cb:${cbKey(url)}`);
   let lastErr;
-  for (let i = 0; i <= maxRetries; i++) {
-    if (i > 0) {
-      const delay = Math.min(800 * Math.pow(2, i-1) + Math.random() * 400, 6000);
-      await new Promise(r => setTimeout(r, delay));
-      if (!cbCheck(url)) throw new Error(`cb:open:${cbKey(url)}`);
-    }
-    const ctrl  = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  for (let i=0;i<=maxRetry;i++) {
+    if (i>0) await new Promise(r=>setTimeout(r,Math.min(800*Math.pow(2,i-1)+Math.random()*400,6000)));
+    if (i>0 && !cbAllow(url)) throw new Error(`cb:${cbKey(url)}`);
+    const ctrl=new AbortController(), t=setTimeout(()=>ctrl.abort(),ms);
     try {
-      const r = await fetch(url, { ...opts, signal: ctrl.signal });
-      clearTimeout(timer);
-      if (RETRY_HTTP.has(r.status) && i < maxRetries) {
-        if (r.status === 429) await new Promise(r => setTimeout(r, 3000));
-        continue;
-      }
-      cbSuccess(url);
-      return r;
-    } catch(e) {
-      clearTimeout(timer);
-      lastErr = e;
-      const retryable = RETRY_ERRS.some(s => (e.message||e.name||"").includes(s));
-      if (!retryable || i >= maxRetries) break;
-    }
+      const r=await fetch(url,{...opts,signal:ctrl.signal});
+      clearTimeout(t);
+      if (RETRY_STATUS.has(r.status)&&i<maxRetry){ if(r.status===429)await new Promise(r=>setTimeout(r,3000)); continue; }
+      cbOk(url); return r;
+    } catch(e){ clearTimeout(t); lastErr=e; if(!RETRY_MSGS.some(s=>(e.message||"").includes(s))&&e.name!=="AbortError") break; }
   }
-  cbFail(url);
-  throw lastErr || new Error("fetch failed");
+  cbFail(url); throw lastErr||new Error("fetch_failed");
 }
+const fetchWithTimeout=(u,o,ms)=>fetchRetry(u,o,ms,1);
 
-// ══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // ADAPTIVE CONCURRENCY
-// ══════════════════════════════════════════════════════════
-const AC = { current: 5, min: 2, max: 8, failMs: 0, successStreak: 0 };
-function acAdjust(success, latencyMs) {
-  if (!success) {
-    AC.current = Math.max(AC.min, AC.current - 1);
-    AC.failMs   = Date.now();
-    AC.successStreak = 0;
-  } else {
-    if (Date.now() - AC.failMs > 30000) {
-      AC.successStreak++;
-      if (AC.successStreak >= 3 && latencyMs < 4000)
-        AC.current = Math.min(AC.max, AC.current + 1);
-    }
+// ═══════════════════════════════════════════════════════════
+const AC = { cur:5, min:2, max:8, streak:0, lastFail:0 };
+function acAdj(ok, latMs) {
+  if (!ok) { AC.cur=Math.max(AC.min,AC.cur-1); AC.streak=0; AC.lastFail=Date.now(); }
+  else if (Date.now()-AC.lastFail>30e3) {
+    if (++AC.streak>=3 && latMs<4000) AC.cur=Math.min(AC.max,AC.cur+1);
   }
 }
-
-async function runLimited(tasks, limitOverride) {
-  const limit   = limitOverride ?? AC.current;
-  const results = new Array(tasks.length).fill(null);
-  let idx = 0, failed = 0, totalMs = 0, count = 0;
-  const worker = async () => {
-    while (idx < tasks.length) {
-      const i = idx++;
-      const t0 = Date.now();
-      try {
-        results[i] = await tasks[i]();
-        totalMs += Date.now() - t0; count++;
-      } catch { results[i] = null; failed++; }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, worker));
-  acAdjust(failed === 0, count > 0 ? totalMs / count : 0);
-  return results;
+async function runLimited(tasks, lim) {
+  const limit=lim??AC.cur, res=new Array(tasks.length).fill(null);
+  let idx=0, fails=0, sumMs=0, cnt=0;
+  const w=async()=>{ while(idx<tasks.length){ const i=idx++,t0=Date.now(); try{res[i]=await tasks[i]();sumMs+=Date.now()-t0;cnt++;}catch{res[i]=null;fails++;} } };
+  await Promise.all(Array.from({length:Math.min(limit,tasks.length)},w));
+  acAdj(fails===0, cnt>0?sumMs/cnt:0);
+  return res;
 }
 
-const YH = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const YH="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 const BUILTIN_STOCK_LIST = [
   // 半導體
@@ -386,174 +295,128 @@ const SCAN_STOCKS = [
 ];
 
 
-// ══════════════════════════════════════════════════════════
-// MARKET SNAPSHOT — pooled refresh, shared cache
-// ══════════════════════════════════════════════════════════
-const SNAPSHOT_KEY = "market:snapshot";
-const SNAPSHOT_TTL = 5 * 60e3;
+// ═══════════════════════════════════════════════════════════
+// MARKET SNAPSHOT  —  pooled refresh, shared SWR cache
+// ═══════════════════════════════════════════════════════════
+const SNAP_KEY = "snap:market"; const SNAP_TTL = 5*60e3;
 
 async function refreshSnapshot() {
   try {
-    const codes  = SCAN_STOCKS.map(s => s.code);
-    const tasks  = codes.map(c => () => fetchYahooChart(c).catch(() => null));
-    const charts = await runLimited(tasks);
-    const snap   = {};
-    charts.forEach((r, i) => {
-      if (r?.stock?.price > 0) snap[codes[i]] = r;
-    });
-    if (Object.keys(snap).length > 0) {
-      cacheSet(SNAPSHOT_KEY, snap, SNAPSHOT_TTL);
-      log.info("snapshot refreshed", { stocks: Object.keys(snap).length });
-    }
+    const tasks=SCAN_STOCKS.map(s=>()=>fetchYahooChart(s.code).catch(()=>null));
+    const res=await runLimited(tasks);
+    const snap={};
+    res.forEach((r,i)=>{ if(r?.stock?.price>0) snap[SCAN_STOCKS[i].code]=r; });
+    if (Object.keys(snap).length>0) { cacheSet(SNAP_KEY,snap,SNAP_TTL); log.info("snap_ok",{n:Object.keys(snap).length}); }
     return snap;
-  } catch(e) { log.error("snapshot refresh failed", { msg: e.message }); return null; }
+  } catch(e){ log.error("snap_fail",{msg:e.message}); return null; }
 }
-
 function getSnapshot() {
-  const { fresh, stale } = cacheGet(SNAPSHOT_KEY);
+  const {fresh,stale}=cacheGet(SNAP_KEY);
   if (fresh) return fresh;
-  if (stale) {
-    setImmediate(() => dedupe("refresh:snapshot", refreshSnapshot));
-    return stale;
-  }
+  if (stale) { setImmediate(()=>dedupe("bg:snap",refreshSnapshot)); return stale; }
   return null;
 }
 
-// ══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // STOCK LIST
-// ══════════════════════════════════════════════════════════
-let _sList = null, _sListTs = 0;
+// ═══════════════════════════════════════════════════════════
+let _sL=null, _sLts=0;
 async function getStockList() {
-  if (_sList && Date.now() - _sListTs < TTL.stocklist) return _sList;
-  const token = FT();
-  if (token) {
+  if (_sL&&Date.now()-_sLts<TTL.stocklist) return _sL;
+  const tok=FT();
+  if (tok) {
     try {
-      const r = await fetchRetry(
-        `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo&token=${token}`,
-        { headers: { "User-Agent": "Mozilla/5.0" } }, 10000, 1
-      );
-      const list = (await r.json())?.data?.filter(s => s.stock_id && s.stock_name)
-        .map(s => ({ code: s.stock_id, name: s.stock_name, type: s.type || "" }));
-      if (list?.length > 100) { _sList = list; _sListTs = Date.now(); return list; }
-    } catch(e) {}
+      const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},10e3,1);
+      const list=(await r.json())?.data?.filter(s=>s.stock_id&&s.stock_name).map(s=>({code:s.stock_id,name:s.stock_name,type:s.type||""}));
+      if (list?.length>100){ _sL=list; _sLts=Date.now(); return list; }
+    } catch(e){}
   }
-  if (!_sList) _sList = BUILTIN_STOCK_LIST;
-  return _sList;
+  if (!_sL) _sL=BUILTIN_STOCK_LIST;
+  return _sL;
 }
 
-// ══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // YAHOO FINANCE
-// ══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 async function fetchYahooChart(code) {
-  return swrFetch(`chart:${code}`, "chart", async () => {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${code}.TW?interval=1d&range=6mo`;
-    const r   = await fetchRetry(url, { headers: { "User-Agent": YH, "Accept": "application/json" } }, 8000, 2);
-    const res = (await r.json())?.chart?.result?.[0];
-    if (!res) throw new Error("no result");
-    const meta = res.meta || {}, ts = res.timestamp || [], q = res.indicators?.quote?.[0] || {};
-    const hist = ts.map((t, i) => ({
-      date:   new Date(t * 1000).toISOString().split("T")[0],
-      open:   +(q.open?.[i]   || q.close?.[i] || 0).toFixed(2),
-      high:   +(q.high?.[i]   || q.close?.[i] || 0).toFixed(2),
-      low:    +(q.low?.[i]    || q.close?.[i] || 0).toFixed(2),
-      close:  +(q.close?.[i]  || 0).toFixed(2),
-      volume: Math.round((q.volume?.[i] || 0) / 1000),
-    })).filter(d => d.close > 0);
-    if (!hist.length) throw new Error("empty hist");
-    const price = meta.regularMarketPrice || hist.at(-1).close;
-    const prev  = hist.at(-2)?.close || meta.chartPreviousClose || price;
-    const change = +(price - prev).toFixed(2);
-    const s = SCAN_STOCKS.find(s => s.code === code);
+  return swrFetch(`chart:${code}`,"chart",async()=>{
+    const url=`https://query1.finance.yahoo.com/v8/finance/chart/${code}.TW?interval=1d&range=6mo`;
+    const r=await fetchRetry(url,{headers:{"User-Agent":YH,"Accept":"application/json"}},8e3,2);
+    const res=(await r.json())?.chart?.result?.[0];
+    if (!res) throw new Error("no_result");
+    const meta=res.meta||{},ts=res.timestamp||[],q=res.indicators?.quote?.[0]||{};
+    const hist=ts.map((t,i)=>({
+      date:new Date(t*1000).toISOString().split("T")[0],
+      open: +(q.open?.[i] ||q.close?.[i]||0).toFixed(2),
+      high: +(q.high?.[i] ||q.close?.[i]||0).toFixed(2),
+      low:  +(q.low?.[i]  ||q.close?.[i]||0).toFixed(2),
+      close:+(q.close?.[i]||0).toFixed(2),
+      volume:Math.round((q.volume?.[i]||0)/1000),
+    })).filter(d=>d.close>0);
+    if (!hist.length) throw new Error("empty_hist");
+    const price=meta.regularMarketPrice||hist.at(-1).close;
+    const prev=hist.at(-2)?.close||meta.chartPreviousClose||price;
+    const change=+(price-prev).toFixed(2);
+    const s=SCAN_STOCKS.find(s=>s.code===code);
     return {
-      stock: { code, name: s?.name || meta.shortName || code, price, change,
-               changePct: (prev > 0 ? ((change/prev)*100) : 0).toFixed(2) + "%",
-               volume: Math.round((meta.regularMarketVolume || 0) / 1000) },
+      stock:{code,name:s?.name||meta.shortName||code,price,change,
+             changePct:(prev>0?(change/prev)*100:0).toFixed(2)+"%",
+             volume:Math.round((meta.regularMarketVolume||0)/1000)},
       hist,
     };
   });
 }
 
 async function getQuote(code) {
-  try { const r = await fetchYahooChart(code); if (r?.stock?.price > 0) return r.stock; } catch(e) {}
-  try {
-    const r = await fetchRetry(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${code}.TW`,
-      { headers: { "User-Agent": YH, "Accept": "application/json" } }, 6000, 1);
-    const q = (await r.json())?.quoteResponse?.result?.[0];
-    if (q?.regularMarketPrice) {
-      const price = q.regularMarketPrice, prev = q.regularMarketPreviousClose || price;
-      const change = +(q.regularMarketChange || 0).toFixed(2);
-      return { code, name: q.shortName || code, price, prev, change,
-               changePct: +((q.regularMarketChangePercent||0)).toFixed(2),
-               open: q.regularMarketOpen||price, high: q.regularMarketDayHigh||price,
-               low: q.regularMarketDayLow||price,
-               volume: Math.round((q.regularMarketVolume||0)/1000), market:"上市", time:"" };
+  try{ const r=await fetchYahooChart(code); if(r?.stock?.price>0)return r.stock; }catch(e){}
+  try{
+    const r=await fetchRetry(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${code}.TW`,{headers:{"User-Agent":YH,"Accept":"application/json"}},6e3,1);
+    const q=(await r.json())?.quoteResponse?.result?.[0];
+    if(q?.regularMarketPrice){
+      const price=q.regularMarketPrice,prev=q.regularMarketPreviousClose||price,ch=+(q.regularMarketChange||0).toFixed(2);
+      return {code,name:q.shortName||code,price,prev,change:ch,changePct:+((q.regularMarketChangePercent||0)).toFixed(2),open:q.regularMarketOpen||price,high:q.regularMarketDayHigh||price,low:q.regularMarketDayLow||price,volume:Math.round((q.regularMarketVolume||0)/1000),market:"上市",time:""};
     }
-  } catch(e) {}
-  try {
-    for (const mkt of ["tse","otc"]) {
-      const r = await fetchRetry(`https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${mkt}_${code}.tw&json=1&delay=0`,
-        { headers: { "Referer":"https://mis.twse.com.tw/", "User-Agent":"Mozilla/5.0" } }, 5000, 1);
-      const item = (await r.json())?.msgArray?.[0];
-      if (!item || !item.z || item.z === "-") continue;
-      const price = parseFloat(item.z), prev = parseFloat(item.y) || price;
-      const change = +(price - prev).toFixed(2);
-      return { code, name:item.n||code, price, prev, change,
-               changePct: prev>0 ? +((change/prev)*100).toFixed(2) : 0,
-               open:parseFloat(item.o)||0, high:parseFloat(item.h)||0, low:parseFloat(item.l)||0,
-               volume:parseInt((item.v||"0").replace(/,/g,""))||0,
-               market: mkt==="tse"?"上市":"上櫃", time:item.t||"" };
+  }catch(e){}
+  try{
+    for(const mkt of["tse","otc"]){
+      const r=await fetchRetry(`https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${mkt}_${code}.tw&json=1&delay=0`,{headers:{"Referer":"https://mis.twse.com.tw/","User-Agent":"Mozilla/5.0"}},5e3,1);
+      const item=(await r.json())?.msgArray?.[0];
+      if(!item||!item.z||item.z==="-")continue;
+      const price=parseFloat(item.z),prev=parseFloat(item.y)||price,ch=+(price-prev).toFixed(2);
+      return {code,name:item.n||code,price,prev,change:ch,changePct:prev>0?+((ch/prev)*100).toFixed(2):0,open:parseFloat(item.o)||0,high:parseFloat(item.h)||0,low:parseFloat(item.l)||0,volume:parseInt((item.v||"0").replace(/,/g,""))||0,market:mkt==="tse"?"上市":"上櫃",time:item.t||""};
     }
-  } catch(e) {}
+  }catch(e){}
   return null;
 }
 
-async function getHistory(code, days = 400) {
-  try {
-    const range = days<=120?"6mo":days<=250?"1y":"2y";
-    const r = await fetchRetry(`https://query1.finance.yahoo.com/v8/finance/chart/${code}.TW?interval=1d&range=${range}`,
-      { headers: { "User-Agent": YH, "Accept": "application/json" } }, 10000, 2);
-    const res = (await r.json())?.chart?.result?.[0];
-    if (!res) throw new Error();
-    const ts = res.timestamp||[], q = res.indicators?.quote?.[0]||{};
-    const hist = ts.map((t,i) => ({
-      date:   new Date(t*1000).toISOString().split("T")[0],
-      open:   +(q.open?.[i]  ||q.close?.[i]||0).toFixed(2),
-      high:   +(q.high?.[i]  ||q.close?.[i]||0).toFixed(2),
-      low:    +(q.low?.[i]   ||q.close?.[i]||0).toFixed(2),
-      close:  +(q.close?.[i] ||0).toFixed(2),
-      volume: Math.round((q.volume?.[i]||0)/1000),
-    })).filter(d => d.close > 0);
-    if (hist.length > 10) return hist;
-  } catch(e) {}
-  try {
-    const token = FT(), end = new Date().toISOString().split("T")[0];
-    const start = new Date(Date.now() - days*864e5).toISOString().split("T")[0];
-    const r = await fetchRetry(
-      `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${code}&start_date=${start}&end_date=${end}&token=${token}`,
-      { headers: { "User-Agent": "Mozilla/5.0" } }, 10000, 1
-    );
-    return (await r.json())?.data?.map(row => ({
-      date:row.date, open:parseFloat(row.open), high:parseFloat(row.max),
-      low:parseFloat(row.min), close:parseFloat(row.close),
-      volume:Math.round(parseInt(row.Trading_Volume)/1000),
-    })) || [];
-  } catch(e) {}
-  return [];
+async function getHistory(code,days=400){
+  try{
+    const range=days<=120?"6mo":days<=250?"1y":"2y";
+    const r=await fetchRetry(`https://query1.finance.yahoo.com/v8/finance/chart/${code}.TW?interval=1d&range=${range}`,{headers:{"User-Agent":YH,"Accept":"application/json"}},10e3,2);
+    const res=(await r.json())?.chart?.result?.[0]; if(!res)throw new Error();
+    const ts=res.timestamp||[],q=res.indicators?.quote?.[0]||{};
+    const hist=ts.map((t,i)=>({date:new Date(t*1000).toISOString().split("T")[0],open:+(q.open?.[i]||q.close?.[i]||0).toFixed(2),high:+(q.high?.[i]||q.close?.[i]||0).toFixed(2),low:+(q.low?.[i]||q.close?.[i]||0).toFixed(2),close:+(q.close?.[i]||0).toFixed(2),volume:Math.round((q.volume?.[i]||0)/1000)})).filter(d=>d.close>0);
+    if(hist.length>10)return hist;
+  }catch(e){}
+  try{
+    const tok=FT(),end=new Date().toISOString().split("T")[0],start=new Date(Date.now()-days*864e5).toISOString().split("T")[0];
+    const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${code}&start_date=${start}&end_date=${end}&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},10e3,1);
+    return (await r.json())?.data?.map(row=>({date:row.date,open:parseFloat(row.open),high:parseFloat(row.max),low:parseFloat(row.min),close:parseFloat(row.close),volume:Math.round(parseInt(row.Trading_Volume)/1000)}))||[];
+  }catch(e){}
+  return[];
 }
-async function getHistoryCached(code, days=400) {
-  return swrFetch(`history:${code}:${days}`, "history", () => getHistory(code, days));
+async function getHistoryCached(code,days=400){
+  return swrFetch(`history:${code}:${days}`,"history",()=>getHistory(code,days));
 }
 
-// ══════════════════════════════════════════════════════════
-// FINMIND helpers — factory with SWR
-// ══════════════════════════════════════════════════════════
-function fmEndpoint(prefix, ttlKey, innerFn) {
-  return (code) => swrFetch(`${prefix}:${code}`, ttlKey, () => innerFn(code));
-}
+// ═══════════════════════════════════════════════════════════
+// FINMIND  —  factory + SWR
+// ═══════════════════════════════════════════════════════════
+function fmEp(pref,ttl,fn){ return (code)=>swrFetch(`${pref}:${code}`,ttl,()=>fn(code)); }
 
-const getChip = fmEndpoint("chip","chip", async code => {
-  const token=FT(),end=new Date().toISOString().split("T")[0],start=new Date(Date.now()-30*864e5).toISOString().split("T")[0];
-  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id=${code}&start_date=${start}&end_date=${end}&token=${token}`,{headers:{"User-Agent":"Mozilla/5.0"}},8000,1);
+const getChip=fmEp("chip","chip",async code=>{
+  const tok=FT(),end=new Date().toISOString().split("T")[0],start=new Date(Date.now()-30*864e5).toISOString().split("T")[0];
+  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id=${code}&start_date=${start}&end_date=${end}&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},8e3,1);
   const rows=(await r.json())?.data||[];if(!rows.length)return null;
   const sum=(keys,arr)=>arr.reduce((s,r)=>keys.some(k=>(r.name||"").includes(k))?s+((r.buy||0)-(r.sell||0)):s,0);
   const dates=[...new Set(rows.map(r=>r.date))].sort();
@@ -561,25 +424,22 @@ const getChip = fmEndpoint("chip","chip", async code => {
   const consec=keys=>{let d=0;for(const dt of[...dates].reverse()){if(sum(keys,rows.filter(r=>r.date===dt))>0)d++;else break;}return d;};
   return {date:dates.at(-1),foreign5:sum(["外資","Foreign"],recent),foreign1:sum(["外資","Foreign"],latest),site5:sum(["投信"],recent),site1:sum(["投信"],latest),dealer5:sum(["自營"],recent),dealer1:sum(["自營"],latest),foreignDays:consec(["外資","Foreign"]),siteDays:consec(["投信"])};
 });
-
-const getMargin = fmEndpoint("margin","margin", async code => {
-  const token=FT(),end=new Date().toISOString().split("T")[0],start=new Date(Date.now()-30*864e5).toISOString().split("T")[0];
-  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMarginPurchaseShortSale&data_id=${code}&start_date=${start}&end_date=${end}&token=${token}`,{headers:{"User-Agent":"Mozilla/5.0"}},8000,1);
+const getMargin=fmEp("margin","margin",async code=>{
+  const tok=FT(),end=new Date().toISOString().split("T")[0],start=new Date(Date.now()-30*864e5).toISOString().split("T")[0];
+  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMarginPurchaseShortSale&data_id=${code}&start_date=${start}&end_date=${end}&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},8e3,1);
   const rows=(await r.json())?.data||[];if(rows.length<2)return null;
   const cur=rows.at(-1),prev=rows.at(-2);
   return {date:cur.date,marginBal:cur.MarginPurchaseTodayBalance||0,marginChange:(cur.MarginPurchaseTodayBalance||0)-(prev.MarginPurchaseTodayBalance||0),shortBal:cur.ShortSaleTodayBalance||0,shortChange:(cur.ShortSaleTodayBalance||0)-(prev.ShortSaleTodayBalance||0)};
 });
-
-const getFundamentals = fmEndpoint("fundamentals","fundamentals", async code => {
-  const token=FT(),end=new Date().toISOString().split("T")[0],start=new Date(Date.now()-30*864e5).toISOString().split("T")[0];
-  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPER&data_id=${code}&start_date=${start}&end_date=${end}&token=${token}`,{headers:{"User-Agent":"Mozilla/5.0"}},8000,1);
+const getFundamentals=fmEp("fundamentals","fundamentals",async code=>{
+  const tok=FT(),end=new Date().toISOString().split("T")[0],start=new Date(Date.now()-30*864e5).toISOString().split("T")[0];
+  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPER&data_id=${code}&start_date=${start}&end_date=${end}&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},8e3,1);
   const rows=(await r.json())?.data||[];if(!rows.length)return null;
   const l=rows.at(-1);return {date:l.date,pe:parseFloat(l.PER)||null,pb:parseFloat(l.PBR)||null};
 });
-
-const getRevenue = fmEndpoint("rev","revenue", async code => {
-  const token=FT(),end=new Date().toISOString().split("T")[0],start=new Date(Date.now()-90*864e5).toISOString().split("T")[0];
-  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id=${code}&start_date=${start}&end_date=${end}&token=${token}`,{headers:{"User-Agent":"Mozilla/5.0"}},8000,1);
+const getRevenue=fmEp("rev","revenue",async code=>{
+  const tok=FT(),end=new Date().toISOString().split("T")[0],start=new Date(Date.now()-90*864e5).toISOString().split("T")[0];
+  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id=${code}&start_date=${start}&end_date=${end}&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},8e3,1);
   const rows=(await r.json())?.data||[];if(!rows.length)return null;
   const l=rows.at(-1),p=rows.find(r=>r.date<l.date);
   const rev=parseFloat(l.revenue)||0,prevRev=parseFloat(p?.revenue)||rev;
@@ -691,6 +551,7 @@ function calcIndicators(history, currentPrice) {
 // ════════════════════════════════════════════════════════════
 // 熱門選股評分系統（100 分滿分）
 // ════════════════════════════════════════════════════════════
+
 
 
 
@@ -861,169 +722,117 @@ function calcStockScore(ind, chip, margin, fundamentals, revenue, history, price
 
 
 
-// indicator/score cache（stable keys）
-function getIndCached(code, hist, price) {
-  const key = `ind:${code}:${hist.length}:${stablePrice(price)}`;
-  const { fresh } = cacheGet(key);
-  if (fresh) return fresh;
-  const ind = calcIndicators(hist, price);
-  cacheSet(key, ind, TTL.indicator);
-  return ind;
+
+// indicator / score cache（stable keys，防 cardinality 爆炸）
+function getIndCached(code,hist,price){
+  const key=`ind:${code}:${hist.length}:${stableP(price)}`;
+  const {fresh}=cacheGet(key); if(fresh)return fresh;
+  const ind=calcIndicators(hist,price); cacheSet(key,ind,TTL.indicator); return ind;
 }
-function getScoreCached(code, ind, chip, margin, fund, rev, hist, price) {
-  const key = `sc:${code}:${hist.length}:${stablePrice(price)}:${chip?.date||0}:${margin?.date||0}`;
-  const { fresh } = cacheGet(key);
-  if (fresh) return fresh;
-  const scored = calcStockScore(ind, chip, margin, fund, rev, hist, price);
-  cacheSet(key, scored, TTL.score);
-  return scored;
+function getScoreCached(code,ind,chip,margin,fund,rev,hist,price){
+  const key=`sc:${code}:${hist.length}:${stableP(price)}:${chip?.date||0}:${margin?.date||0}`;
+  const {fresh}=cacheGet(key); if(fresh)return fresh;
+  const s=calcStockScore(ind,chip,margin,fund,rev,hist,price); cacheSet(key,s,TTL.score); return s;
 }
 
-// ══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // ENDPOINTS
-// ══════════════════════════════════════════════════════════
-app.get("/health", (req, res) => res.json({
-  ok: true, version: "v11",
-  cache: CACHE.size, inflight: IN_FLIGHT.size, concurrency: AC.current,
-  circuit: CB_MAP.size > 0 ? [...CB_MAP.keys()] : [],
-  overload: _inflight,
-  uptime: Math.floor(process.uptime()) + "s",
-  memory: Math.round(process.memoryUsage().heapUsed/1024/1024) + "MB",
+// ═══════════════════════════════════════════════════════════
+app.get("/health",(req,res)=>res.json({
+  ok:true, version:"v11",
+  cache:CACHE.size, inflight:IN_FLIGHT.size, concurrency:AC.cur,
+  circuit:CB_MAP.size>0?[...CB_MAP.keys()]:[],
+  overload:_inflight, uptime:Math.floor(process.uptime())+"s",
+  memory:Math.round(process.memoryUsage().heapUsed/1024/1024)+"MB",
 }));
 
-app.get("/search", async (req, res) => {
-  const q = (req.query.q||"").trim().replace(/[^\w\u4e00-\u9fff]/g,"").slice(0,10);
-  if (!q) return res.json([]);
-  try {
-    const list = await getStockList();
-    return res.json(list
-      .filter(s => s.code.startsWith(q) || s.name.includes(q))
-      .sort((a,b) => {
-        if (a.code===q) return -1; if (b.code===q) return 1;
-        if (a.code.startsWith(q)&&!b.code.startsWith(q)) return -1;
-        if (!a.code.startsWith(q)&&b.code.startsWith(q)) return 1;
-        return a.code.localeCompare(b.code);
-      }).slice(0,10));
-  } catch(e) { res.json([]); }
+app.get("/search",async(req,res)=>{
+  const q=(req.query.q||"").trim().replace(/[^\w\u4e00-\u9fff]/g,"").slice(0,10);
+  if(!q)return res.json([]);
+  try{
+    const list=await getStockList();
+    return res.json(list.filter(s=>s.code.startsWith(q)||s.name.includes(q)).sort((a,b)=>{if(a.code===q)return -1;if(b.code===q)return 1;if(a.code.startsWith(q)&&!b.code.startsWith(q))return -1;if(!a.code.startsWith(q)&&b.code.startsWith(q))return 1;return a.code.localeCompare(b.code);}).slice(0,10));
+  }catch(e){res.json([]);}
 });
 
-// ── /scan ──────────────────────────────────────────────
-let _lastScanTs = 0;
-app.get("/scan", async (req, res) => {
-  const mode  = req.query.mode || "volume";
-  const limit = Math.min(parseInt(req.query.limit||20), 20);
-  const key   = `scan:${mode}:${limit}`;
+// ── /scan ─────────────────────────────────────────────
+let _lastScanTs=0;
+app.get("/scan",async(req,res)=>{
+  const mode=req.query.mode||"volume";
+  const limit=Math.min(parseInt(req.query.limit||20),20);
+  const key=`scan:${mode}:${limit}`;
 
-  // SWR: fresh → immediate; stale → return stale + bg refresh
-  const { fresh, stale } = cacheGet(key);
-  if (fresh) return res.json({ ...fresh, cached: true });
-  if (stale) {
-    setImmediate(() => _runScan(mode, limit, key).catch(() => {}));
-    return res.json({ ...stale, cached: true, stale: true });
+  // SWR：fresh → 直接回；stale → 回 stale + bg refresh
+  const {fresh,stale}=cacheGet(key);
+  if(fresh) return res.json({...fresh,cached:true});
+  if(stale){
+    setImmediate(()=>_runScan(mode,limit,key).catch(()=>{}));
+    return res.json({...stale,cached:true,stale:true});
   }
 
-  const ip = req.ip || "unknown";
-  if (rateLimit(ip, 5, 60000)) return res.status(429).json({ error: "請求過於頻繁，請稍後再試" });
-  _lastScanTs = Date.now();
-
-  try {
-    const data = await _runScan(mode, limit, key);
+  const ip=req.ip||"unknown";
+  if(rateLimit(ip,5,60000)) return res.status(429).json({error:"請求過於頻繁，請稍後再試"});
+  _lastScanTs=Date.now();
+  try{
+    const data=await _runScan(mode,limit,key);
     res.json(data);
-  } catch(e) {
-    log.error("scan error", { id: req.id, msg: e.message });
-    if (stale) return res.json({ ...stale, cached: true, stale: true });
-    const msg = e.message === "scan timeout" ? "掃描逾時，請稍後再試" : "掃描失敗：" + e.message;
-    res.status(e.message==="scan timeout"?503:500).json({ error: msg });
+  }catch(e){
+    log.error("scan_err",{id:req.id,msg:e.message});
+    if(stale) return res.json({...stale,cached:true,stale:true});
+    res.status(e.message==="scan_timeout"?503:500).json({error:e.message==="scan_timeout"?"掃描逾時，請稍後再試":"掃描失敗："+e.message});
   }
 });
 
-async function _runScan(mode, limit, cacheKey) {
-  const deadline = Date.now() + 26000;
-  const tick = () => { if (Date.now() > deadline) throw new Error("scan timeout"); };
+async function _runScan(mode,limit,cacheKey){
+  const dl=Date.now()+26000; const tick=()=>{if(Date.now()>dl)throw new Error("scan_timeout");};
 
-  // 1. 嘗試用 snapshot cache（最快路徑）
-  const snap = getSnapshot();
-  let priceMap = new Map(), sparkMap = new Map();
-
-  if (snap && Object.keys(snap).length >= limit) {
-    Object.values(snap).forEach(r => {
-      if (r?.stock?.price > 0) priceMap.set(r.stock.code, r.stock);
-      if (r?.hist?.length)    sparkMap.set(r.stock.code, r.hist);
-    });
-    log.info("scan from snapshot", { stocks: priceMap.size });
-  } else {
+  // 1. snapshot 快速路徑
+  const snap=getSnapshot();
+  let priceMap=new Map(),sparkMap=new Map();
+  if(snap&&Object.keys(snap).length>=limit){
+    Object.values(snap).forEach(r=>{if(r?.stock?.price>0){priceMap.set(r.stock.code,r.stock);if(r.hist?.length)sparkMap.set(r.stock.code,r.hist);}});
+    log.info("scan_snap",{n:priceMap.size});
+  }else{
     // 2. 重新抓（adaptive concurrency）
     tick();
-    const tasks    = SCAN_STOCKS.map(s => () => fetchYahooChart(s.code).catch(() => null));
-    const charts   = await runLimited(tasks);
-    charts.forEach((r, i) => {
-      if (!r) return;
-      if (r.stock?.price > 0) priceMap.set(r.stock.code, r.stock);
-      if (r.hist?.length)     sparkMap.set(SCAN_STOCKS[i].code, r.hist);
-    });
-    log.info("scan fetched", { got: priceMap.size, total: SCAN_STOCKS.length, concurrency: AC.current });
-
-    // 補抓失敗的（Yahoo v7 batch）
-    const missing = SCAN_STOCKS.filter(s => !priceMap.has(s.code)).map(s => s.code);
-    if (missing.length) {
-      try {
-        const r = await fetchRetry(
-          `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(missing.map(c=>c+".TW").join(","))}`,
-          { headers: { "User-Agent": YH, "Accept": "application/json" } }, 8000, 1
-        );
-        (await r.json())?.quoteResponse?.result?.forEach(q => {
-          const code  = q.symbol?.replace(".TW","");
-          const price = q.regularMarketPrice;
-          if (!price || !code) return;
-          const prev = q.regularMarketPreviousClose||price;
-          priceMap.set(code, { code,
-            name: SCAN_STOCKS.find(s=>s.code===code)?.name||q.shortName||code,
-            price, change:+(q.regularMarketChange||0).toFixed(2),
-            changePct:((q.regularMarketChangePercent||0)).toFixed(2)+"%",
-            volume: Math.round((q.regularMarketVolume||0)/1000) });
-        });
-      } catch(e) {}
+    const tasks=SCAN_STOCKS.map(s=>()=>fetchYahooChart(s.code).catch(()=>null));
+    const charts=await runLimited(tasks);
+    charts.forEach((r,i)=>{if(!r)return;if(r.stock?.price>0)priceMap.set(r.stock.code,r.stock);if(r.hist?.length)sparkMap.set(SCAN_STOCKS[i].code,r.hist);});
+    log.info("scan_fetch",{got:priceMap.size,total:SCAN_STOCKS.length,concurrency:AC.cur});
+    // 補抓失敗的
+    const miss=SCAN_STOCKS.filter(s=>!priceMap.has(s.code)).map(s=>s.code);
+    if(miss.length){
+      try{
+        const r=await fetchRetry(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(miss.map(c=>c+".TW").join(","))}`,{headers:{"User-Agent":YH,"Accept":"application/json"}},8e3,1);
+        (await r.json())?.quoteResponse?.result?.forEach(q=>{const code=q.symbol?.replace(".TW",""),price=q.regularMarketPrice;if(!price||!code)return;const prev=q.regularMarketPreviousClose||price;priceMap.set(code,{code,name:SCAN_STOCKS.find(s=>s.code===code)?.name||q.shortName||code,price,change:+(q.regularMarketChange||0).toFixed(2),changePct:((q.regularMarketChangePercent||0)).toFixed(2)+"%",volume:Math.round((q.regularMarketVolume||0)/1000)});});
+      }catch(e){}
     }
   }
 
-  let stocks = SCAN_STOCKS.map(s => priceMap.get(s.code)).filter(s => s?.price > 0);
-  if (!stocks.length) throw new Error("no_price_data");
+  let stocks=SCAN_STOCKS.map(s=>priceMap.get(s.code)).filter(s=>s?.price>0);
+  if(!stocks.length) throw new Error("no_price_data");
+  stocks.sort((a,b)=>mode==="change"?parseFloat(b.changePct)-parseFloat(a.changePct):b.volume-a.volume);
+  stocks=stocks.slice(0,limit); tick();
 
-  stocks.sort((a,b) => mode==="change"
-    ? parseFloat(b.changePct) - parseFloat(a.changePct)
-    : b.volume - a.volume);
-  stocks = stocks.slice(0, limit);
-  tick();
-
-  // 3. 指標/評分（有 cache，快）
-  const results = stocks.map(stock => {
-    try {
-      const hist   = sparkMap.get(stock.code) || [];
-      const chip   = (cacheGet(`chip:${stock.code}`).fresh   || cacheGet(`chip:${stock.code}`).stale);
-      const margin = (cacheGet(`margin:${stock.code}`).fresh || cacheGet(`margin:${stock.code}`).stale);
-      const fund   = (cacheGet(`fundamentals:${stock.code}`).fresh || cacheGet(`fundamentals:${stock.code}`).stale);
-      const rev    = (cacheGet(`rev:${stock.code}`).fresh    || cacheGet(`rev:${stock.code}`).stale);
-      const ind    = getIndCached(stock.code, hist, stock.price);
-      const scored = getScoreCached(stock.code, ind, chip, margin, fund, rev, hist, stock.price);
-      return {
-        ...stock, direction:ind.direction||"—",
-        bull:ind.bull||0, bear:ind.bear||0, rsi:ind.rsi,
-        maTrend:ind.maTrend||"—", macd:ind.macd, macdHist:ind.macdHist, volTrend:ind.volTrend||"—",
-        score:scored.score, grade:scored.grade, gradeColor:scored.gradeColor, scoreDetail:scored.detail,
-        fundScore:scored.detail._fund||0, techScore:scored.detail._tech||0, volScore:scored.detail._vol||0,
-        chipScore:scored.detail._chip||0, marginScore:scored.detail._margin||0, themeScore:scored.detail._theme||0,
-      };
-    } catch(e) {
-      return { ...stock, direction:"—", bull:0, bear:0, score:0, grade:"資料不足", gradeColor:"#374151" };
-    }
+  // 3. 指標/評分（有 cache）
+  const results=stocks.map(stock=>{
+    try{
+      const hist=sparkMap.get(stock.code)||[];
+      const chip =(cacheGet(`chip:${stock.code}`).fresh  ||cacheGet(`chip:${stock.code}`).stale);
+      const margin=(cacheGet(`margin:${stock.code}`).fresh||cacheGet(`margin:${stock.code}`).stale);
+      const fund =(cacheGet(`fundamentals:${stock.code}`).fresh||cacheGet(`fundamentals:${stock.code}`).stale);
+      const rev  =(cacheGet(`rev:${stock.code}`).fresh   ||cacheGet(`rev:${stock.code}`).stale);
+      const ind=getIndCached(stock.code,hist,stock.price);
+      const sc=getScoreCached(stock.code,ind,chip,margin,fund,rev,hist,stock.price);
+      return {...stock,direction:ind.direction||"—",bull:ind.bull||0,bear:ind.bear||0,rsi:ind.rsi,maTrend:ind.maTrend||"—",macd:ind.macd,macdHist:ind.macdHist,volTrend:ind.volTrend||"—",score:sc.score,grade:sc.grade,gradeColor:sc.gradeColor,scoreDetail:sc.detail,fundScore:sc.detail._fund||0,techScore:sc.detail._tech||0,volScore:sc.detail._vol||0,chipScore:sc.detail._chip||0,marginScore:sc.detail._margin||0,themeScore:sc.detail._theme||0};
+    }catch(e){return {...stock,direction:"—",bull:0,bear:0,score:0,grade:"資料不足",gradeColor:"#374151"};}
   });
-  results.sort((a,b) => b.score - a.score);
-  tick();
+  results.sort((a,b)=>b.score-a.score); tick();
 
-  // 4. Claude AI（可選，失敗不影響結果）
-  let final = results;
-  if (AK()) {
-    try {
+  // 4. Claude AI（optional，失敗不影響）
+  let final=results;
+  if(AK()){
+    try{
           const prompt = `你是台股職業交易員，根據以下${limit}支熱門股評分資料，每支給出一句話操作建議（15字內），格式：代號|建議
 
 ${
@@ -1033,80 +842,57 @@ ${
     }
 
 請逐行輸出，格式：代號|一句話建議（要符合評分等級，強勢股說強勢，不建議股說風險）`;
-      const aiRes = await fetchRetry("https://api.anthropic.com/v1/messages", {
-        method:"POST",
-        headers:{"Content-Type":"application/json","x-api-key":AK(),"anthropic-version":"2023-06-01"},
-        body:JSON.stringify({ model:"claude-haiku-4-5-20251001", max_tokens:600,
-          messages:[{role:"user",content:prompt}] }),
-      }, 7000, 1);
-      const text = (await aiRes.json()).content?.[0]?.text || "";
-      const map  = {};
-      text.split("\n").forEach(l => { const [c,...r]=l.split("|"); if(c&&r.length) map[c.trim()]=r.join("|").trim(); });
-      final = results.map(s => ({ ...s, suggestion: map[s.code] || s.grade || "觀察中" }));
-    } catch(e) {
-      final = results.map(s => ({ ...s, suggestion: s.grade || "觀察中" }));
-    }
-  } else {
-    final = results.map(s => ({ ...s, suggestion: s.grade || "觀察中" }));
-  }
+      const aiRes=await fetchRetry("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":AK(),"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:600,messages:[{role:"user",content:prompt}]})},7e3,1);
+      const txt=(await aiRes.json()).content?.[0]?.text||"";
+      const map={};txt.split("\n").forEach(l=>{const[c,...r]=l.split("|");if(c&&r.length)map[c.trim()]=r.join("|").trim();});
+      final=results.map(s=>({...s,suggestion:map[s.code]||s.grade||"觀察中"}));
+    }catch(e){final=results.map(s=>({...s,suggestion:s.grade||"觀察中"}));}
+  }else{final=results.map(s=>({...s,suggestion:s.grade||"觀察中"}));}
 
-  const resp = { mode, stocks: final, time: new Date().toISOString(), _v: "v11" };
-  cacheSet(cacheKey, resp, TTL.scan);
+  const resp={mode,stocks:final,time:new Date().toISOString(),_v:"v11"};
+  cacheSet(cacheKey,resp,TTL.scan);
 
-  // 背景預載籌碼
-  setImmediate(async () => {
-    for (const s of final.slice(0, 8)) {
-      try {
-        await Promise.allSettled([getChip(s.code),getMargin(s.code),getFundamentals(s.code),getRevenue(s.code)]);
-        await new Promise(r => setTimeout(r, 700));
-      } catch(e) {}
+  // 背景預載籌碼（不阻塞）
+  setImmediate(async()=>{
+    for(const s of final.slice(0,8)){
+      try{await Promise.allSettled([getChip(s.code),getMargin(s.code),getFundamentals(s.code),getRevenue(s.code)]);await new Promise(r=>setTimeout(r,700));}catch(e){}
     }
   });
-
   return resp;
 }
 
 // ── /analyze ──────────────────────────────────────────
-app.post("/analyze", async (req, res) => {
-  const ip = req.ip || "unknown";
-  if (rateLimit(ip, 10, 60000)) return res.status(429).json({ error: "請求過於頻繁" });
+app.post("/analyze",async(req,res)=>{
+  const ip=req.ip||"unknown";
+  if(rateLimit(ip,10,60000)) return res.status(429).json({error:"請求過於頻繁"});
+  const dl=Date.now()+27000; const tick=()=>{if(Date.now()>dl)throw new Error("analyze_timeout");};
 
-  const deadline = Date.now() + 27000;
-  const tick = () => { if (Date.now() > deadline) throw new Error("analyze timeout"); };
+  const {code:raw}=req.body;
+  if(!raw) return res.status(400).json({error:"Missing code"});
+  const code=String(raw).replace(/[^A-Za-z0-9]/g,"").slice(0,6).toUpperCase();
+  if(!code) return res.status(400).json({error:"Invalid code"});
 
-  const { code: rawCode } = req.body;
-  if (!rawCode) return res.status(400).json({ error: "Missing code" });
-  const code = String(rawCode).replace(/[^A-Za-z0-9]/g,"").slice(0,6).toUpperCase();
-  if (!code)  return res.status(400).json({ error: "Invalid code" });
-
-  try {
+  try{
     tick();
-    // critical: quote + history（串行會超時，並行）
-    const [qR, hR] = await Promise.allSettled([getQuote(code), getHistoryCached(code)]);
-    const q    = qR.status==="fulfilled" ? qR.value : null;
-    const hist = hR.status==="fulfilled" ? (hR.value||[]) : [];
+    // critical data 優先
+    const [qR,hR]=await Promise.allSettled([getQuote(code),getHistoryCached(code)]);
+    const q=qR.status==="fulfilled"?qR.value:null;
+    const hist=hR.status==="fulfilled"?(hR.value||[]):[];
+    if(!q) return res.status(404).json({error:`找不到股票 ${code}`});
+    const price=q.price; tick();
 
-    // partial response：quote 失敗就報錯，其他繼續
-    if (!q) return res.status(404).json({ error: `找不到股票 ${code}` });
-    const price = q.price;
-    tick();
+    // optional data（全部並行，任一失敗繼續）
+    const [cR,mR,fR,rR]=await Promise.allSettled([getChip(code),getMargin(code),getFundamentals(code),getRevenue(code)]);
+    const chip=cR.status==="fulfilled"?cR.value:null;
+    const margin=mR.status==="fulfilled"?mR.value:null;
+    const fund=fR.status==="fulfilled"?fR.value:null;
+    const rev=rR.status==="fulfilled"?rR.value:null;
 
-    // optional：全部並行，任一失敗不影響整體
-    const [cR,mR,fR,rR] = await Promise.allSettled([
-      getChip(code), getMargin(code), getFundamentals(code), getRevenue(code)
-    ]);
-    const chip   = cR.status==="fulfilled" ? cR.value : null;
-    const margin = mR.status==="fulfilled" ? mR.value : null;
-    const fund   = fR.status==="fulfilled" ? fR.value : null;
-    const rev    = rR.status==="fulfilled" ? rR.value : null;
+    const ind=getIndCached(code,hist,price);
+    const scored=getScoreCached(code,ind,chip,margin,fund,rev,hist,price);
 
-    const ind    = getIndCached(code, hist, price);
-    const scored = getScoreCached(code, ind, chip, margin, fund, rev, hist, price);
-
-    // AI 可選（失敗回 partial response）
-    if (!AK()) {
-      return res.json({ text:"（未設定 AI API Key）", quote:q, indicators:ind, chip, margin, fundamentals:fund, revenue:rev, scored });
-    }
+    // partial response：AI 可選，失敗也回傳基本資料
+    if(!AK()) return res.json({text:"（未設定 AI API Key）",quote:q,indicators:ind,chip,margin,fundamentals:fund,revenue:rev,scored});
 
         const prompt = `你是台灣頂級職業交易員與機構級台股研究員，
 熟悉台股主力籌碼、法人邏輯、AI供應鏈、產業循環、
@@ -1250,91 +1036,84 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
 最大風險：
 最值得關注的關鍵訊號：`;
 
-
     tick();
-    const aiResp = await fetchRetry("https://api.anthropic.com/v1/messages", {
-      method:"POST",
-      headers:{"Content-Type":"application/json","x-api-key":AK(),"anthropic-version":"2023-06-01"},
-      body:JSON.stringify({ model:"claude-haiku-4-5-20251001", max_tokens:2000,
-        messages:[{role:"user",content:prompt}] }),
-    }, 20000, 1);
-    const fullText = (await aiResp.json()).content?.[0]?.text || "";
-    res.json({ text:fullText, quote:q, indicators:ind, chip, margin, fundamentals:fund, revenue:rev, scored });
+    const aiR=await fetchRetry("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":AK(),"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:2000,messages:[{role:"user",content:prompt}]})},20e3,1);
+    const fullText=(await aiR.json()).content?.[0]?.text||"";
+    res.json({text:fullText,quote:q,indicators:ind,chip,margin,fundamentals:fund,revenue:rev,scored});
 
-  } catch(e) {
-    log.error("analyze error", { id:req.id, code, msg:e.message });
-    if (e.message==="analyze timeout")
-      return res.status(503).json({ error:"分析逾時，請稍後再試" });
-    res.status(500).json({ error: e.message||"分析失敗" });
+  }catch(e){
+    log.error("analyze_err",{id:req.id,code,msg:e.message});
+    if(e.message==="analyze_timeout") return res.status(503).json({error:"分析逾時，請稍後再試"});
+    res.status(500).json({error:e.message||"分析失敗"});
   }
 });
 
-app.get("/test-apis", async (req,res) => {
-  const results = {};
+app.get("/test-apis",async(req,res)=>{
+  const R={};
   await Promise.allSettled([
-    fetchRetry(`https://query1.finance.yahoo.com/v8/finance/chart/2330.TW?interval=1d&range=5d`,{headers:{"User-Agent":YH}},8000,1).then(r=>r.json()).then(d=>{const p=d?.chart?.result?.[0]?.meta?.regularMarketPrice;results.yahooChart=p?`✅ ${p}`:"⚠ no data";}).catch(e=>{results.yahooChart="❌ "+e.message;}),
-    fetchRetry(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=2330.TW`,{headers:{"User-Agent":YH}},6000,1).then(r=>r.json()).then(d=>{const p=d?.quoteResponse?.result?.[0]?.regularMarketPrice;results.yahooQuote=p?`✅ ${p}`:"⚠ no data";}).catch(e=>{results.yahooQuote="❌ "+e.message;}),
-    fetchRetry("https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw&json=1&delay=0",{headers:{"Referer":"https://mis.twse.com.tw/","User-Agent":"Mozilla/5.0"}},5000,1).then(r=>r.json()).then(d=>{const i=d?.msgArray?.[0];results.twse=i?`✅ z=${i.z}`:"⚠ no data";}).catch(e=>{results.twse="❌ "+e.message;}),
-    (()=>{const t=FT(),td=new Date().toISOString().split("T")[0],st=new Date(Date.now()-14*864e5).toISOString().split("T")[0];return fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=2330&start_date=${st}&end_date=${td}&token=${t}`,{headers:{"User-Agent":"Mozilla/5.0"}},8000,1).then(r=>r.json()).then(d=>{const rows=d?.data||[];results.finmind=rows.length?`✅ ${rows.length} rows token=${t?"yes":"no"}`:`⚠ empty token=${t?"yes":"no"}`;}).catch(e=>{results.finmind="❌ "+e.message;});})(),
+    fetchRetry(`https://query1.finance.yahoo.com/v8/finance/chart/2330.TW?interval=1d&range=5d`,{headers:{"User-Agent":YH}},8e3,1).then(r=>r.json()).then(d=>{const p=d?.chart?.result?.[0]?.meta?.regularMarketPrice;R.yahooChart=p?`✅ ${p}`:"⚠ no data";}).catch(e=>{R.yahooChart="❌ "+e.message;}),
+    fetchRetry(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=2330.TW`,{headers:{"User-Agent":YH}},6e3,1).then(r=>r.json()).then(d=>{const p=d?.quoteResponse?.result?.[0]?.regularMarketPrice;R.yahooQuote=p?`✅ ${p}`:"⚠";}).catch(e=>{R.yahooQuote="❌ "+e.message;}),
+    fetchRetry("https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw&json=1&delay=0",{headers:{"Referer":"https://mis.twse.com.tw/","User-Agent":"Mozilla/5.0"}},5e3,1).then(r=>r.json()).then(d=>{const i=d?.msgArray?.[0];R.twse=i?`✅ z=${i.z}`:"⚠";}).catch(e=>{R.twse="❌ "+e.message;}),
+    (()=>{const tok=FT(),td=new Date().toISOString().split("T")[0],st=new Date(Date.now()-14*864e5).toISOString().split("T")[0];return fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=2330&start_date=${st}&end_date=${td}&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},8e3,1).then(r=>r.json()).then(d=>{const rows=d?.data||[];R.finmind=rows.length?`✅ ${rows.length}r tok=${tok?"y":"n"}`:`⚠ tok=${tok?"y":"n"}`;}).catch(e=>{R.finmind="❌ "+e.message;});})(),
   ]);
-  res.json({ ts:new Date().toISOString(), v:"v11", cb:[...CB_MAP.keys()], concurrency:AC.current, apis:results });
+  res.json({ts:new Date().toISOString(),v:"v11",concurrency:AC.cur,circuit:[...CB_MAP.keys()],apis:R});
 });
 
-app.get("/cache-stats", (req,res) => res.json({
-  cache: CACHE.size, inflight: IN_FLIGHT.size, rate: RATE_MAP.size,
-  concurrency: AC.current, inflight_req: _inflight,
-  circuit: [...CB_MAP.entries()].map(([k,v])=>({host:k,fails:v.fails.length,open:Date.now()<v.openUntil})),
-  uptime: Math.floor(process.uptime())+"s",
-  memory: Math.round(process.memoryUsage().heapUsed/1024/1024)+"MB",
+app.get("/cache-stats",(req,res)=>res.json({
+  cache:CACHE.size, inflight:IN_FLIGHT.size, rate:RATE_MAP.size, concurrency:AC.cur, overload:_inflight,
+  circuit:[...CB_MAP.entries()].map(([k,v])=>({host:k,fails:v.fails.length,open:Date.now()<v.openUntil})),
+  uptime:Math.floor(process.uptime())+"s", memory:Math.round(process.memoryUsage().heapUsed/1024/1024)+"MB",
 }));
 
-app.post("/cache-clear", (req,res) => {
-  const t = req.headers["x-admin-token"] || req.body?.token;
-  if (!ADMIN_TK || t !== ADMIN_TK) return res.status(401).json({ error:"Unauthorized" });
-  const n = CACHE.size; CACHE.clear(); IN_FLIGHT.clear();
-  res.json({ ok:true, cleared:n });
+app.post("/cache-clear",(req,res)=>{
+  const t=req.headers["x-admin-token"]||req.body?.token;
+  if(!ADMIN_TK||t!==ADMIN_TK) return res.status(401).json({error:"Unauthorized"});
+  const n=CACHE.size; CACHE.clear(); IN_FLIGHT.clear();
+  res.json({ok:true,cleared:n});
 });
 
-// ── Background scheduler ─────────────────────────────
-let _bgRunning = false;
-setInterval(async () => {
-  if (Date.now() - _lastScanTs > 5*60e3 || _bgRunning) return;
-  _bgRunning = true;
-  try { await _runScan("volume", 10, "scan:volume:10").catch(() => {}); }
-  finally { _bgRunning = false; }
-}, 2.5 * 60e3);
+// ═══════════════════════════════════════════════════════════
+// BACKGROUND SCHEDULER
+// ═══════════════════════════════════════════════════════════
+let _bgRunning=false;
+setInterval(async()=>{
+  if(Date.now()-_lastScanTs>5*60e3||_bgRunning)return;
+  _bgRunning=true;
+  try{await _runScan("volume",10,"scan:volume:10").catch(()=>{});}
+  finally{_bgRunning=false;}
+},2.5*60e3);
 
-// Snapshot 初始化（啟動後 10s 預熱）
-setTimeout(() => refreshSnapshot().catch(() => {}), 10000);
+// snapshot 啟動預熱（10s 後，讓 express 先 ready）
+setTimeout(()=>refreshSnapshot().catch(()=>{}),10000);
 
-// ══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // PROCESS LIFECYCLE
-// ══════════════════════════════════════════════════════════
-process.on("unhandledRejection", (reason) => {
-  log.error("unhandledRejection", { reason: String(reason?.message || reason) });
+// ═══════════════════════════════════════════════════════════
+process.on("unhandledRejection",reason=>{
+  log.error("unhandledRejection",{reason:String(reason?.message||reason)});
+  // 不 crash，只記錄
 });
-process.on("uncaughtException", (err) => {
-  log.error("uncaughtException", { msg: err.message, stack: err.stack?.split("\n")[1] });
-  setTimeout(() => process.exit(1), 1500);
-});
-
-const server = app.listen(PORT, () => {
-  log.info("server started", { port: PORT, node: process.version, pid: process.pid });
+process.on("uncaughtException",err=>{
+  log.error("uncaughtException",{msg:err.message,stack:err.stack?.split("\n")[1]||""});
+  // uncaughtException 後狀態不確定，延遲 1.5s 讓 log flush 後重啟
+  setTimeout(()=>process.exit(1),1500);
 });
 
-async function gracefulShutdown(signal) {
-  log.info("shutdown begin", { signal, inflight: _inflight });
-  // stop accepting new connections
-  server.close(async () => {
-    // drain in-flight（最多等 8s）
-    const t = Date.now();
-    while (_inflight > 0 && Date.now() - t < 8000)
-      await new Promise(r => setTimeout(r, 200));
-    log.info("shutdown complete", { drained: _inflight === 0 });
+const server=app.listen(PORT,()=>{
+  log.info("started",{port:PORT,node:process.version,pid:process.pid});
+});
+
+async function gracefulShutdown(sig){
+  log.info("shutdown",{signal:sig,inflight:_inflight});
+  server.close(async()=>{
+    // drain in-flight（最多 8s）
+    const t=Date.now();
+    while(_inflight>0&&Date.now()-t<8000)
+      await new Promise(r=>setTimeout(r,200));
+    log.info("shutdown_done",{drained:_inflight===0});
     process.exit(0);
   });
-  setTimeout(() => { log.warn("shutdown forced"); process.exit(1); }, 12000);
+  setTimeout(()=>{log.warn("shutdown_forced");process.exit(1);},12000);
 }
-
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-process.on("SIGINT",  () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM",()=>gracefulShutdown("SIGTERM"));
+process.on("SIGINT", ()=>gracefulShutdown("SIGINT"));

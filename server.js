@@ -878,32 +878,36 @@ app.post("/analyze",async(req,res)=>{
   const code=String(raw).replace(/[^A-Za-z0-9]/g,"").slice(0,6).toUpperCase();
   if(!code) return res.status(400).json({error:"Invalid code"});
 
+  // 宣告在 try 外，catch 才能存取
+  let q=null, hist=[], history=[], price=0;
+  let chip=null, margin=null, fund=null, rev=null, fundamentals=null, revenue=null;
+  let ind=null, scored=null;
+
   try{
     tick();
     const t0=Date.now();
     // critical data 優先
     const [qR,hR]=await Promise.allSettled([getQuote(code),getHistoryCached(code)]);
     log.info("analyze_step1",{code,ms:Date.now()-t0,q:qR.status,h:hR.status});
-    const q=qR.status==="fulfilled"?qR.value:null;
-    const hist=hR.status==="fulfilled"?(hR.value||[]):[];
-    const history=hist; // prompt 相容
+    q=qR.status==="fulfilled"?qR.value:null;
+    hist=hR.status==="fulfilled"?(hR.value||[]):[];
+    history=hist;
     if(!q) return res.status(404).json({error:`找不到股票 ${code}`});
-    const price=q.price; tick();
+    price=q.price; tick();
 
     // optional data（全部並行，任一失敗繼續）
     const t1=Date.now();
     const [cR,mR,fR,rR]=await Promise.allSettled([getChip(code),getMargin(code),getFundamentals(code),getRevenue(code)]);
     log.info("analyze_step2",{code,ms:Date.now()-t1,c:cR.status,m:mR.status,f:fR.status,r:rR.status});
-    const chip=cR.status==="fulfilled"?cR.value:null;
-    const margin=mR.status==="fulfilled"?mR.value:null;
-    const fund=fR.status==="fulfilled"?fR.value:null;
-    const rev=rR.status==="fulfilled"?rR.value:null;
-    // prompt 相容別名（必須在 fund/rev 宣告之後）
-    const fundamentals=fund;
-    const revenue=rev;
+    chip=cR.status==="fulfilled"?cR.value:null;
+    margin=mR.status==="fulfilled"?mR.value:null;
+    fund=fR.status==="fulfilled"?fR.value:null;
+    rev=rR.status==="fulfilled"?rR.value:null;
+    fundamentals=fund;
+    revenue=rev;
 
-    const ind=getIndCached(code,hist,price);
-    const scored=getScoreCached(code,ind,chip,margin,fund,rev,hist,price);
+    ind=getIndCached(code,hist,price);
+    scored=getScoreCached(code,ind,chip,margin,fund,rev,hist,price);
 
     // partial response：AI 可選，失敗也回傳基本資料
     if(!AK()) return res.json({text:"（未設定 AI API Key）",quote:q,indicators:ind,chip,margin,fundamentals:fund,revenue:rev,scored});
@@ -1043,15 +1047,16 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
 
   }catch(e){
     log.error("analyze_err",{id:req.id,code,msg:e.message});
-    if(e.message?.includes("api.anthropic.com")||e.message?.includes("anthropic")){
-      // Claude timeout → 回傳技術分析結果（不含 AI 報告）
-      if(typeof q!=="undefined"&&q){
-        return res.json({text:"（AI 報告暫時無法產生，請稍後再試）",quote:q,indicators:typeof ind!=="undefined"?ind:null,chip:typeof chip!=="undefined"?chip:null,margin:typeof margin!=="undefined"?margin:null,fundamentals:typeof fund!=="undefined"?fund:null,revenue:typeof rev!=="undefined"?rev:null,scored:typeof scored!=="undefined"?scored:null});
-      }
+    // Claude API timeout → 回傳基本資料（不含 AI 報告）
+    const isClaudeTimeout = e.message?.includes("api.anthropic.com");
+    if(isClaudeTimeout && q){
+      return res.json({text:"（AI 報告暫時無法產生，請稍後再試）",quote:q,indicators:ind,chip,margin,fundamentals:fund,revenue:rev,scored});
     }
     if(e.message==="analyze_timeout")
       return res.status(503).json({error:"分析逾時，請稍後再試"});
-    res.status(500).json({error:e.message||"分析失敗"});
+    // 其他錯誤：友善訊息
+    const errMsg = e.message?.includes("fetch_timeout") ? "資料抓取逾時，請稍後再試" : (e.message||"分析失敗");
+    res.status(500).json({error:errMsg});
   }
 });
 

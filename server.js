@@ -343,7 +343,7 @@ async function getStockList() {
 async function fetchYahooChart(code) {
   return swrFetch(`chart:${code}`,"chart",async()=>{
     const url=`https://query1.finance.yahoo.com/v8/finance/chart/${code}.TW?interval=1d&range=6mo`;
-    const r=await fetchRetry(url,{headers:{"User-Agent":YH,"Accept":"application/json"}},12e3,2);
+    const r=await fetchRetry(url,{headers:{"User-Agent":YH,"Accept":"application/json"}},8e3,1);
     const res=(await r.json())?.chart?.result?.[0];
     if (!res) throw new Error("no_result");
     const meta=res.meta||{},ts=res.timestamp||[],q=res.indicators?.quote?.[0]||{};
@@ -418,7 +418,7 @@ function fmEp(pref,ttl,fn){ return (code)=>swrFetch(`${pref}:${code}`,ttl,()=>fn
 
 const getChip=fmEp("chip","chip",async code=>{
   const tok=FT(),end=new Date().toISOString().split("T")[0],start=new Date(Date.now()-30*864e5).toISOString().split("T")[0];
-  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id=${code}&start_date=${start}&end_date=${end}&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},8e3,1);
+  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id=${code}&start_date=${start}&end_date=${end}&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},5e3,1);
   const rows=(await r.json())?.data||[];if(!rows.length)return null;
   const sum=(keys,arr)=>arr.reduce((s,r)=>keys.some(k=>(r.name||"").includes(k))?s+((r.buy||0)-(r.sell||0)):s,0);
   const dates=[...new Set(rows.map(r=>r.date))].sort();
@@ -428,20 +428,20 @@ const getChip=fmEp("chip","chip",async code=>{
 });
 const getMargin=fmEp("margin","margin",async code=>{
   const tok=FT(),end=new Date().toISOString().split("T")[0],start=new Date(Date.now()-30*864e5).toISOString().split("T")[0];
-  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMarginPurchaseShortSale&data_id=${code}&start_date=${start}&end_date=${end}&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},8e3,1);
+  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMarginPurchaseShortSale&data_id=${code}&start_date=${start}&end_date=${end}&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},5e3,1);
   const rows=(await r.json())?.data||[];if(rows.length<2)return null;
   const cur=rows.at(-1),prev=rows.at(-2);
   return {date:cur.date,marginBal:cur.MarginPurchaseTodayBalance||0,marginChange:(cur.MarginPurchaseTodayBalance||0)-(prev.MarginPurchaseTodayBalance||0),shortBal:cur.ShortSaleTodayBalance||0,shortChange:(cur.ShortSaleTodayBalance||0)-(prev.ShortSaleTodayBalance||0)};
 });
 const getFundamentals=fmEp("fundamentals","fundamentals",async code=>{
   const tok=FT(),end=new Date().toISOString().split("T")[0],start=new Date(Date.now()-30*864e5).toISOString().split("T")[0];
-  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPER&data_id=${code}&start_date=${start}&end_date=${end}&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},8e3,1);
+  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPER&data_id=${code}&start_date=${start}&end_date=${end}&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},5e3,1);
   const rows=(await r.json())?.data||[];if(!rows.length)return null;
   const l=rows.at(-1);return {date:l.date,pe:parseFloat(l.PER)||null,pb:parseFloat(l.PBR)||null};
 });
 const getRevenue=fmEp("rev","revenue",async code=>{
   const tok=FT(),end=new Date().toISOString().split("T")[0],start=new Date(Date.now()-90*864e5).toISOString().split("T")[0];
-  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id=${code}&start_date=${start}&end_date=${end}&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},8e3,1);
+  const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id=${code}&start_date=${start}&end_date=${end}&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},5e3,1);
   const rows=(await r.json())?.data||[];if(!rows.length)return null;
   const l=rows.at(-1),p=rows.find(r=>r.date<l.date);
   const rev=parseFloat(l.revenue)||0,prevRev=parseFloat(p?.revenue)||rev;
@@ -867,7 +867,7 @@ ${
 app.post("/analyze",async(req,res)=>{
   const ip=req.ip||"unknown";
   if(rateLimit(ip,10,60000)) return res.status(429).json({error:"請求過於頻繁"});
-  const dl=Date.now()+27000; const tick=()=>{if(Date.now()>dl)throw new Error("analyze_timeout");};
+  const dl=Date.now()+29000; const tick=()=>{if(Date.now()>dl)throw new Error("analyze_timeout");};
 
   const {code:raw}=req.body;
   if(!raw) return res.status(400).json({error:"Missing code"});
@@ -1043,7 +1043,7 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
 最值得關注的關鍵訊號：`;
 
     tick();
-    const aiR=await fetchRetry("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":AK(),"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:2000,messages:[{role:"user",content:prompt}]})},20e3,1);
+    const aiR=await fetchRetry("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":AK(),"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:2000,messages:[{role:"user",content:prompt}]})},15e3,1);
     const fullText=(await aiR.json()).content?.[0]?.text||"";
     res.json({text:fullText,quote:q,indicators:ind,chip,margin,fundamentals:fund,revenue:rev,scored});
 

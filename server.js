@@ -633,6 +633,102 @@ function calcStockScore(ind, chip, margin, fundamentals, revenue, history, price
 
 
 
+// ── 動能評分（0~100）────────────────────────────────────
+function calcMomentumScore(ind, chip, hist, stock) {
+  let score = 0;
+  const price    = stock.price  || 0;
+  const changePct = parseFloat(stock.changePct) || 0;
+  const vol      = stock.volume || 0;
+
+  // 1. 今日漲幅（max 20分）
+  if (changePct >= 7)       score += 20;
+  else if (changePct >= 5)  score += 16;
+  else if (changePct >= 3)  score += 12;
+  else if (changePct >= 1)  score += 6;
+  else if (changePct > 0)   score += 2;
+
+  // 2. 成交量放大（max 15分）
+  const vol5avg = hist.length >= 5
+    ? hist.slice(-6,-1).reduce((s,h)=>s+(h.volume||0),0)/5 : 0;
+  if (vol5avg > 0) {
+    const volRatio = vol / vol5avg;
+    if (volRatio >= 3)     score += 15;
+    else if (volRatio >= 2) score += 12;
+    else if (volRatio >= 1.5) score += 8;
+    else if (volRatio >= 1.2) score += 4;
+  }
+
+  // 3. 均線多頭排列 MA5>MA10>MA20（max 15分）
+  if (ind.ma5 && ind.ma10 && ind.ma20) {
+    if (ind.ma5 > ind.ma10 && ind.ma10 > ind.ma20) score += 15;
+    else if (ind.ma5 > ind.ma20)                    score += 7;
+  }
+  // 股價站上 MA20（bonus 5分）
+  if (ind.ma20 && price > ind.ma20) score += 5;
+
+  // 4. RSI（max 15分）
+  if (ind.rsi >= 70)      score += 10; // 強勢但注意過熱
+  else if (ind.rsi >= 60) score += 15; // 最佳動能區
+  else if (ind.rsi >= 55) score += 10;
+  else if (ind.rsi >= 50) score += 5;
+
+  // 5. MACD 柱狀體翻正（max 10分）
+  if (ind.macdHist > 0)   score += 10;
+  else if (ind.macd > 0)  score += 5;
+
+  // 6. 突破近20日高點（max 10分）
+  const high20 = hist.length >= 20
+    ? hist.slice(-20).reduce((mx,h)=>Math.max(mx,h.high||h.close),-Infinity) : 0;
+  if (high20 > 0 && price >= high20 * 0.99) score += 10;
+
+  // 7. 法人籌碼（max 10分）
+  if (chip) {
+    if (chip.foreignDays >= 3)  score += 5;
+    else if (chip.foreignDays >= 1) score += 2;
+    if (chip.siteDays >= 3)     score += 5;
+    else if (chip.siteDays >= 1)    score += 2;
+  }
+
+  // 強勢動能加分：同時滿足多條件
+  const isStrong = changePct >= 3
+    && vol5avg > 0 && vol/vol5avg >= 1.5
+    && ind.ma20 && price > ind.ma20
+    && (ind.rsi||0) >= 55
+    && (ind.macdHist||0) > 0;
+  if (isStrong) score += 5; // bonus
+
+  return Math.min(100, Math.round(score));
+}
+
+// ── 動能標籤 ────────────────────────────────────────────
+function getMomentumTags(ind, chip, hist, stock) {
+  const tags   = [];
+  const price  = stock.price || 0;
+  const chgPct = parseFloat(stock.changePct) || 0;
+  const vol    = stock.volume || 0;
+  const vol5avg = hist.length >= 5
+    ? hist.slice(-6,-1).reduce((s,h)=>s+(h.volume||0),0)/5 : 0;
+
+  if (chgPct >= 3)  tags.push({text:"漲幅強勢",cls:"bull"});
+  if (vol5avg > 0 && vol/vol5avg >= 2) tags.push({text:"爆量",cls:"hot"});
+  else if (vol5avg > 0 && vol/vol5avg >= 1.5) tags.push({text:"放量",cls:"bull"});
+
+  const high20 = hist.length >= 20
+    ? hist.slice(-20).reduce((mx,h)=>Math.max(mx,h.high||h.close),-Infinity) : 0;
+  if (high20 > 0 && price >= high20 * 0.99) tags.push({text:"突破高點",cls:"hot"});
+
+  if (ind.ma5 && ind.ma10 && ind.ma20 && ind.ma5>ind.ma10 && ind.ma10>ind.ma20)
+    tags.push({text:"多頭排列",cls:"bull"});
+
+  if ((ind.rsi||0) >= 70) tags.push({text:"RSI過熱",cls:"warn"});
+  else if ((ind.rsi||0) >= 60) tags.push({text:"RSI強勢",cls:"bull"});
+
+  if (chip?.foreignDays >= 3) tags.push({text:"外資連買",cls:"bull"});
+  if (chip?.siteDays    >= 3) tags.push({text:"投信連買",cls:"bull"});
+
+  return tags;
+}
+
 function getIndCached(code,hist,price){
   const key=`ind:${code}:${hist.length}:${stableP(price)}`;
   const{fresh}=cacheGet(key);if(fresh)return fresh;
@@ -704,7 +800,7 @@ async function _runScan(mode,limit,cacheKey){
   }
   let stocks=SCAN_STOCKS.map(s=>priceMap.get(s.code)).filter(s=>s?.price>0);
   if(!stocks.length)throw new Error("no_price_data");
-  stocks.sort((a,b)=>mode==="change"?parseFloat(b.changePct)-parseFloat(a.changePct):b.volume-a.volume);
+  stocks.sort((a,b)=>mode==="change"?parseFloat(b.changePct)-parseFloat(a.changePct):mode==="momentum"?parseFloat(b.changePct)-parseFloat(a.changePct):b.volume-a.volume);
   stocks=stocks.slice(0,limit);tick();
   const results=stocks.map(stock=>{
     try{
@@ -715,14 +811,22 @@ async function _runScan(mode,limit,cacheKey){
       const rev=(cacheGet(`rev:${stock.code}`).fresh||cacheGet(`rev:${stock.code}`).stale);
       const ind=getIndCached(stock.code,hist,stock.price);
       const sc=getScoreCached(stock.code,ind,chip,margin,fund,rev,hist,stock.price);
-      return{...stock,direction:ind.direction||"—",bull:ind.bull||0,bear:ind.bear||0,rsi:ind.rsi,
+      const ms=calcMomentumScore(ind,chip,hist,stock);
+        const mt=getMomentumTags(ind,chip,hist,stock);
+        return{...stock,direction:ind.direction||"—",bull:ind.bull||0,bear:ind.bear||0,rsi:ind.rsi,
         maTrend:ind.maTrend||"—",macd:ind.macd,macdHist:ind.macdHist,volTrend:ind.volTrend||"—",
         score:sc.score,grade:sc.grade,gradeColor:sc.gradeColor,scoreDetail:sc.detail,
         fundScore:sc.detail._fund||0,techScore:sc.detail._tech||0,volScore:sc.detail._vol||0,
-        chipScore:sc.detail._chip||0,marginScore:sc.detail._margin||0,themeScore:sc.detail._theme||0};
+        chipScore:sc.detail._chip||0,marginScore:sc.detail._margin||0,themeScore:sc.detail._theme||0,
+        momentumScore:ms,momentumTags:mt};
     }catch(e){return{...stock,direction:"—",bull:0,bear:0,score:0,grade:"資料不足",gradeColor:"#374151"};}
   });
-  results.sort((a,b)=>b.score-a.score);tick();
+  if(mode==="momentum"){
+    results.sort((a,b)=>b.momentumScore-a.momentumScore);
+  }else{
+    results.sort((a,b)=>b.score-a.score);
+  }
+  tick();
   let final=results;
   if(AK()){try{
         const prompt = `你是台股職業交易員，根據以下${limit}支熱門股評分資料，每支給出一句話操作建議（15字內），格式：代號|建議

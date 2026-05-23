@@ -228,8 +228,9 @@ async function fetchRetry(url, opts={}, ms=8000, maxRetry=2) {
       cbOk(url); return r;
     } catch(e){ clearTimeout(t); lastErr=e; if(!RETRY_MSGS.some(s=>(e.message||"").includes(s))&&e.name!=="AbortError") break; }
   }
-  cbFail(url);
+  // AbortError = 我們設的 timeout，不代表遠端有問題，不要開 circuit
   if (lastErr?.name === "AbortError") throw new Error(`fetch_timeout: ${cbKey(url)}`);
+  cbFail(url);
   throw lastErr || new Error("fetch_failed");
 }
 const fetchWithTimeout=(u,o,ms)=>fetchRetry(u,o,ms,1);
@@ -870,7 +871,7 @@ ${
 app.post("/analyze",async(req,res)=>{
   const ip=req.ip||"unknown";
   if(rateLimit(ip,10,60000)) return res.status(429).json({error:"請求過於頻繁"});
-  const dl=Date.now()+55000; const tick=()=>{if(Date.now()>dl)throw new Error("analyze_timeout");};
+  const dl=Date.now()+58000; const tick=()=>{if(Date.now()>dl)throw new Error("analyze_timeout");};
 
   const {code:raw}=req.body;
   if(!raw) return res.status(400).json({error:"Missing code"});
@@ -1052,14 +1053,14 @@ ${revenue ? `最新月營收：${(revenue.revenue/1000).toFixed(0)} 千萬　年
     tick();
     const t2=Date.now();
     log.info("analyze_step3_claude_start",{code,elapsed:Date.now()-t0});
-    const aiR=await fetchRetry("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":AK(),"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:2000,messages:[{role:"user",content:prompt}]})},45e3,0);
+    const aiR=await fetchRetry("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":AK(),"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:2000,messages:[{role:"user",content:prompt}]})},50e3,0);
     const fullText=(await aiR.json()).content?.[0]?.text||"";
     log.info("analyze_step3_claude_done",{code,ms:Date.now()-t2,chars:fullText.length});
     res.json({text:fullText,quote:q,indicators:ind,chip,margin,fundamentals:fund,revenue:rev,scored});
 
   }catch(e){
     log.error("analyze_err",{id:req.id,code,msg:e.message});
-    if(e.message?.includes("fetch_timeout:api.anthropic.com")||e.message?.includes("fetch_timeout: api.anthropic.com")){
+    if(e.message?.includes("api.anthropic.com")||e.message?.includes("anthropic")){
       // Claude timeout → 回傳技術分析結果（不含 AI 報告）
       if(typeof q!=="undefined"&&q){
         return res.json({text:"（AI 報告暫時無法產生，請稍後再試）",quote:q,indicators:typeof ind!=="undefined"?ind:null,chip:typeof chip!=="undefined"?chip:null,margin:typeof margin!=="undefined"?margin:null,fundamentals:typeof fund!=="undefined"?fund:null,revenue:typeof rev!=="undefined"?rev:null,scored:typeof scored!=="undefined"?scored:null});

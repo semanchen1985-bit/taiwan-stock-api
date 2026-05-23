@@ -770,10 +770,11 @@ app.post("/analyze",async(req,res)=>{
     const rev=rR.status==="fulfilled"?rR.value:null;
     const ind=getIndCached(code,hist,price);
     const scored=getScoreCached(code,ind,chip,margin,fund,rev,hist,price);
-    // 檢查是否有快取的 AI 文字
+    // 檢查是否有快取的 AI 文字（少於 500 字不算有效）
     const{fresh:cachedAI}=cacheGet(`aitext:${code}`);
+    const validCache = cachedAI && cachedAI.length >= 500 ? cachedAI : null;
     res.json({quote:q,indicators:ind,chip,margin,fundamentals:fund,revenue:rev,scored,
-      text:cachedAI||null,aiReady:!!AK(),history:hist.slice(-30)});
+      text:validCache,aiReady:!!AK(),history:hist.slice(-30)});
   }catch(e){
     log.error("analyze_err",{id:req.id,code,msg:e.message});
     res.status(500).json({error:e.message||"分析失敗"});
@@ -788,9 +789,9 @@ app.post("/analyze-ai",async(req,res)=>{
   const{code:raw,quote:q,indicators:ind,chip,margin,fundamentals:fund,revenue:rev,history:histArr}=req.body;
   if(!raw||!q)return res.status(400).json({error:"Missing data"});
   const code=String(raw).replace(/[^A-Za-z0-9]/g,"").slice(0,6).toUpperCase();
-  // 先回傳快取
+  // 先回傳快取（少於 500 字的快取視為無效，強制重新生成）
   const{fresh:cachedAI}=cacheGet(`aitext:${code}`);
-  if(cachedAI)return res.json({text:cachedAI,cached:true});
+  if(cachedAI && cachedAI.length >= 500) return res.json({text:cachedAI,cached:true});
   const history=Array.isArray(histArr)?histArr:[];
   const price=q.price||0;
   const fundamentals=fund;  // prompt 相容

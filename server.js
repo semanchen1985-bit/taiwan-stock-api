@@ -767,25 +767,134 @@ app.get("/search",async(req,res)=>{
 // ── /scan ────────────────────────────────────────────────
 let _lastScanTs=0;
 app.get("/scan",async(req,res)=>{
-  const mode=req.query.mode||"volume",limit=Math.min(parseInt(req.query.limit||20),20);
-  const key=`scan:${mode}:${limit}`;
+  const mode     = req.query.mode     || "volume";
+  const limit    = Math.min(parseInt(req.query.limit||20), 100);
+  const universe = req.query.universe || "custom"; // custom|large|all
+  const key = `scan:${mode}:${limit}:${universe}`;
   const{fresh,stale}=cacheGet(key);
   if(fresh)return res.json({...fresh,cached:true});
-  if(stale){setImmediate(()=>_runScan(mode,limit,key).catch(()=>{}));return res.json({...stale,cached:true,stale:true});}
+  // momentum+all 模式可能很慢，有 stale 直接回傳並背景更新
+  if(stale){
+    setImmediate(()=>_runScan(mode,limit,key,universe).catch(()=>{}));
+    return res.json({...stale,cached:true,stale:true});
+  }
   const ip=req.ip||"unknown";
   if(rateLimit(ip,5,60000))return res.status(429).json({error:"請求過於頻繁，請稍後再試"});
   _lastScanTs=Date.now();
-  try{res.json(await _runScan(mode,limit,key));}
+  try{res.json(await _runScan(mode,limit,key,universe));}
   catch(e){log.error("scan_err",{msg:e.message});
     if(stale)return res.json({...stale,cached:true,stale:true});
     res.status(503).json({error:"掃描失敗："+e.message});}
 });
 
-async function _runScan(mode,limit,cacheKey){
+
+// ════════════════════════════════════════════════════════
+// 動能全市場掃描（大池子專用）
+// ════════════════════════════════════════════════════════
+async function _runMomentumScan(poolCodes, limit, cacheKey) {
+  const t0 = Date.now();
+  log.info("momentum_scan_start", { pool: poolCodes.length, limit });
+
+  // 分批抓 Yahoo chart（concurrency=5，每批最多 50 支）
+  const BATCH = 50;
+  const results = [];
+
+  for (let i = 0; i < poolCodes.length; i += BATCH) {
+    // deadline 保護：超過 50s 就停止，回傳目前結果
+    if (Date.now() - t0 > 50000) {
+      log.warn("momentum_scan_timeout", { scanned: i, total: poolCodes.length });
+      break;
+    }
+
+    const batch = poolCodes.slice(i, i + BATCH);
+    const tasks = batch.map(code => async () => {
+      try {
+        const r = await fetchYahooChart(code);
+        if (!r?.stock?.price) return null;
+        const hist = r.hist || [];
+        const ind  = calcIndicators(hist, r.stock.price);
+        // 快速過濾：只保留有上漲且成交量正常的
+        const chg = parseFloat(r.stock.changePct) || 0;
+        if (chg < -5) return null; // 大跌的跳過
+        const chip = cacheGet(`chip:${code}`).fresh || cacheGet(`chip:${code}`).stale;
+        const ms   = calcMomentumScore(ind, chip, hist, r.stock);
+        const mt   = getMomentumTags(ind, chip, hist, r.stock);
+        return { ...r.stock, momentumScore: ms, momentumTags: mt,
+          ind, rsi: ind.rsi, maTrend: ind.maTrend };
+      } catch(e) { return null; }
+    });
+
+    const batchResults = await runLimited(tasks, 5);
+    batchResults.forEach(s => { if (s && s.momentumScore >= 20) results.push(s); });
+  }
+
+  // 排序取前 limit 名
+  results.sort((a, b) => b.momentumScore - a.momentumScore);
+  const top = results.slice(0, limit);
+
+  // 加 Claude AI 建議（只針對 top N，不超時）
+  let final = top;
+  if (AK() && top.length > 0) {
+    try {
+      const prompt = `你是台股職業交易員，根據以下${top.length}支動能股評分資料，每支給出一句話操作建議（15字內），格式：代號|建議\n\n${
+        top.map(s=>`${s.code} ${s.name} 動能分數${s.momentumScore} 漲幅${s.changePct} RSI${Math.round(s.rsi||0)}`).join("\n")
+      }`;
+      const aiRes = await fetchRetry("https://api.anthropic.com/v1/messages", {
+        method:"POST",
+        headers:{"Content-Type":"application/json","x-api-key":AK(),"anthropic-version":"2023-06-01"},
+        body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:600,
+          messages:[{role:"user",content:prompt}]}),
+      }, 12000, 1);
+      const txt = (await aiRes.json()).content?.[0]?.text || "";
+      const map = {};
+      txt.split("\n").forEach(l => { const [c,...r]=l.split("|"); if(c&&r.length) map[c.trim()]=r.join("|").trim(); });
+      final = top.map(s => ({ ...s, suggestion: map[s.code] || "動能強勢，注意追高風險" }));
+    } catch(e) {
+      final = top.map(s => ({ ...s, suggestion: "動能強勢，注意追高風險" }));
+    }
+  } else {
+    final = top.map(s => ({ ...s, suggestion: "動能強勢，注意追高風險" }));
+  }
+
+  log.info("momentum_scan_done", { found: results.length, top: top.length, ms: Date.now()-t0 });
+
+  const resp = { mode:"momentum", universe: "large", stocks: final,
+    time: new Date().toISOString(), _v:"momentum" };
+  cacheSet(cacheKey, resp, TTL.scan);
+  return resp;
+}
+
+async function _runScan(mode,limit,cacheKey,universe="custom"){
   const dl=Date.now()+55000;const tick=()=>{if(Date.now()>dl)throw new Error("scan_timeout");};
+
+  // ── 根據 universe 決定股票池 ────────────────────────
+  let poolCodes=[];
+  if(universe==="all"||universe==="large"){
+    try{
+      const all=await getStockList();
+      poolCodes=all.map(s=>s.code).filter(c=>{
+        if(!/^\d+$/.test(c))return false;
+        const n=parseInt(c);
+        if(universe==="large")return c.length===4&&n>=1000&&n<=9999;
+        return c.length<=5;
+      });
+      log.info("scan_pool",{universe,total:poolCodes.length});
+    }catch(e){
+      log.warn("scan_pool_err",{msg:e.message});
+      poolCodes=SCAN_STOCKS.map(s=>s.code);
+    }
+  }else{
+    poolCodes=SCAN_STOCKS.map(s=>s.code);
+  }
+
+  // momentum + 大池子 → 走專用流程
+  if(mode==="momentum"&&universe!=="custom"){
+    return await _runMomentumScan(poolCodes,limit,cacheKey);
+  }
+
   const snap=getSnapshot();
   let priceMap=new Map(),sparkMap=new Map();
-  if(snap&&Object.keys(snap).length>=limit){
+  if(universe==="custom"&&snap&&Object.keys(snap).length>=limit){
     Object.values(snap).forEach(r=>{if(r?.stock?.price>0){priceMap.set(r.stock.code,r.stock);if(r.hist?.length)sparkMap.set(r.stock.code,r.hist);}});
   }else{
     tick();

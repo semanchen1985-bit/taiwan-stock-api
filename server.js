@@ -793,7 +793,7 @@ app.get("/scan",async(req,res)=>{
 // ════════════════════════════════════════════════════════
 const SECTOR_MAP = {
   "半導體": ["2330","2303","2454","2379","2344","3034","3711","2408","2337","3533","2449","6770","3443","2351"],
-  "電子組裝": ["2317","2382","2356","2354","2352","3231","2362","2365","4938","3702"],
+  "電子組裝": ["2317","2382","2356","2354","2352","3231","2362","2365","4938","3702","2357","2353"],
   "伺服器/AI": ["2382","3231","6669","6789","3017","2345","5483","6235","3006","2353"],
   "網通": ["2345","4904","3044","6443","6415","3149","4977","5285","8299","3706"],
   "PCB": ["3037","2349","8046","3706","6183","3028","6269","2445","3189","3094"],
@@ -1054,7 +1054,7 @@ async function _runSectorScan(poolCodes, limit, cacheKey) {
   // 3. 計算每族群熱度
   const sectorList = [];
   for (const [sector, stocks] of Object.entries(sectorGroups)) {
-    if (stocks.length < 2) continue; // 太少股票的族群跳過
+    if (stocks.length < 1) continue; // 空族群跳過
     const n = stocks.length;
     const avgChg     = stocks.reduce((s,st)=>s+(parseFloat(st.changePct)||0),0)/n;
     const upCount    = stocks.filter(s=>(parseFloat(s.changePct)||0)>0).length;
@@ -1147,9 +1147,18 @@ async function _runScan(mode,limit,cacheKey,universe="custom"){
     poolCodes=SCAN_STOCKS.map(s=>s.code);
   }
 
-  // sector → 族群熱度掃描
+  // sector → 族群熱度掃描（固定用 large 池）
   if(mode==="sector"){
-    return await _runSectorScan(poolCodes,limit,cacheKey);
+    // 如果目前 poolCodes 太少（custom），強制改用 large
+    let sectorPool = poolCodes;
+    if(sectorPool.length < 100){
+      try{
+        const all=await getStockList();
+        sectorPool=all.map(s=>s.code).filter(c=>/^\d{4}$/.test(c)&&parseInt(c)>=1000&&parseInt(c)<=9999);
+        log.info("sector_force_large",{pool:sectorPool.length});
+      }catch(e){ sectorPool=poolCodes; }
+    }
+    return await _runSectorScan(sectorPool,limit,cacheKey);
   }
   // momentum + 大池子 → 走專用流程
   if(mode==="momentum"&&universe!=="custom"){
@@ -1186,12 +1195,13 @@ async function _runScan(mode,limit,cacheKey,universe="custom"){
       const sc=getScoreCached(stock.code,ind,chip,margin,fund,rev,hist,stock.price);
       const ms=calcMomentumScore(ind,chip,hist,stock);
         const mt=getMomentumTags(ind,chip,hist,stock);
+        const sector=getSector(stock.code,null);
         return{...stock,direction:ind.direction||"—",bull:ind.bull||0,bear:ind.bear||0,rsi:ind.rsi,
         maTrend:ind.maTrend||"—",macd:ind.macd,macdHist:ind.macdHist,volTrend:ind.volTrend||"—",
         score:sc.score,grade:sc.grade,gradeColor:sc.gradeColor,scoreDetail:sc.detail,
         fundScore:sc.detail._fund||0,techScore:sc.detail._tech||0,volScore:sc.detail._vol||0,
         chipScore:sc.detail._chip||0,marginScore:sc.detail._margin||0,themeScore:sc.detail._theme||0,
-        momentumScore:ms,momentumTags:mt};
+        momentumScore:ms,momentumTags:mt,sector};
     }catch(e){return{...stock,direction:"—",bull:0,bear:0,score:0,grade:"資料不足",gradeColor:"#374151"};}
   });
   if(mode==="momentum"){

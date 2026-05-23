@@ -753,7 +753,10 @@ app.get("/search",async(req,res)=>{
   if(!q)return res.json([]);
   try{
     const list=await getStockList();
-    return res.json(list.filter(s=>s.code.startsWith(q)||s.name.includes(q)).sort((a,b)=>{if(a.code===q)return -1;if(b.code===q)return 1;if(a.code.startsWith(q)&&!b.code.startsWith(q))return -1;if(!a.code.startsWith(q)&&b.code.startsWith(q))return 1;return a.code.localeCompare(b.code);}).slice(0,10));
+    // 去重（FinMind + BUILTIN 可能重複）
+    const seen=new Set();
+    const unique=list.filter(s=>{ if(seen.has(s.code)) return false; seen.add(s.code); return true; });
+    return res.json(unique.filter(s=>s.code.startsWith(q)||s.name.includes(q)).sort((a,b)=>{if(a.code===q)return -1;if(b.code===q)return 1;if(a.code.startsWith(q)&&!b.code.startsWith(q))return -1;if(!a.code.startsWith(q)&&b.code.startsWith(q))return 1;return a.code.localeCompare(b.code);}).slice(0,10));
   }catch(e){res.json([]);}
 });
 

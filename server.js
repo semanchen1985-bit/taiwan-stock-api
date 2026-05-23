@@ -793,6 +793,8 @@ app.post("/analyze-ai",async(req,res)=>{
   if(cachedAI)return res.json({text:cachedAI,cached:true});
   const history=Array.isArray(histArr)?histArr:[];
   const price=q.price||0;
+  const fundamentals=fund;  // prompt 相容
+  const revenue=rev;        // prompt 相容
   try{
         const prompt = `你是台灣頂級職業交易員與機構級台股研究員，
 熟悉台股主力籌碼、法人邏輯、AI供應鏈、產業循環、

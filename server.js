@@ -878,7 +878,9 @@ app.post("/analyze",async(req,res)=>{
     const [qR,hR]=await Promise.allSettled([getQuote(code),getHistoryCached(code)]);
     const q=qR.status==="fulfilled"?qR.value:null;
     const hist=hR.status==="fulfilled"?(hR.value||[]):[];
-    const history=hist; // prompt 相容
+    const history=hist;         // prompt 相容
+    const fundamentals=fund;    // prompt 相容
+    const revenue=rev;          // prompt 相容
     if(!q) return res.status(404).json({error:`找不到股票 ${code}`});
     const price=q.price; tick();
 

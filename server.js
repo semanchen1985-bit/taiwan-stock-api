@@ -1007,6 +1007,173 @@ async function _runMomentumScan(poolCodes, limit, cacheKey) {
 
 
 // ════════════════════════════════════════════════════════
+// 鎖漲停策略
+// ════════════════════════════════════════════════════════
+function getLimitUpPrice(prevClose) {
+  if (!prevClose || prevClose <= 0) return 0;
+  const raw = prevClose * 1.1;
+  // 台股 tick size 簡化版
+  if (raw < 10)       return Math.round(raw * 100) / 100;
+  if (raw < 50)       return Math.round(raw * 10) / 10;
+  if (raw < 100)      return Math.round(raw * 4) / 4; // 0.25
+  if (raw < 500)      return Math.round(raw * 2) / 2; // 0.5
+  if (raw < 1000)     return Math.round(raw);
+  return Math.round(raw / 5) * 5;
+}
+
+function calcLimitUpScore(stock, hist, chip, margin) {
+  let score = 0;
+  const price    = stock.price  || 0;
+  const changePct = parseFloat(stock.changePct) || 0;
+  const vol      = stock.volume || 0;
+
+  // 1. 漲幅接近漲停（25分）
+  if (changePct >= 9.5)     score += 25;
+  else if (changePct >= 8)  score += 18;
+  else if (changePct >= 6)  score += 10;
+  else if (changePct >= 4)  score += 4;
+
+  // 2. 爆量（20分）
+  const vol5avg = hist.length >= 5
+    ? hist.slice(-6,-1).reduce((s,h)=>s+(h.volume||0),0)/5 : 0;
+  const volRatio = vol5avg > 0 ? vol / vol5avg : 0;
+  if (volRatio >= 2)        score += 20;
+  else if (volRatio >= 1.5) score += 12;
+  else if (volRatio >= 1.2) score += 6;
+
+  // 3. 突破型態（15分）
+  const high20 = hist.length >= 20
+    ? hist.slice(-20).reduce((mx,h)=>Math.max(mx,h.high||h.close),-Infinity) : 0;
+  const high60 = hist.length >= 60
+    ? hist.slice(-60).reduce((mx,h)=>Math.max(mx,h.high||h.close),-Infinity) : 0;
+  if (high60 > 0 && price >= high60 * 0.99)      score += 15;
+  else if (high20 > 0 && price >= high20 * 0.99)  score += 10;
+
+  // 4. 多頭排列（10分）
+  const closes = hist.map(h=>h.close);
+  const ma = n => closes.length>=n ? closes.slice(-n).reduce((s,v)=>s+v,0)/n : null;
+  const ma5=ma(5),ma10=ma(10),ma20=ma(20);
+  if (ma5&&ma10&&ma20&&ma5>ma10&&ma10>ma20&&price>ma20) score += 10;
+  else if (ma20&&price>ma20) score += 4;
+
+  // 5. 法人買超（10分）
+  if (chip) {
+    if ((chip.site1>0)||(chip.siteDays>=2)) score += 6;
+    if (chip.foreign1>0)                    score += 4;
+  }
+
+  // 6. 籌碼集中（10分）—— 融資沒有暴增
+  if (margin) {
+    const marginChange = margin.marginChange || 0;
+    const marginBal    = margin.marginBal    || 1;
+    const marginRatio  = Math.abs(marginChange) / marginBal;
+    if (changePct >= 3 && marginRatio < 0.02) score += 10; // 漲但融資沒暴增
+    else if (marginRatio >= 0.05) score -= 5;              // 融資暴增扣分
+  } else if (changePct >= 3) {
+    score += 5; // 無融資資料時，漲幅強就給一半分
+  }
+
+  // 7. 鎖單強度（暫無五檔資料，給 0）
+  // score += 0;
+
+  return Math.min(100, Math.max(0, Math.round(score)));
+}
+
+function getLimitUpTags(stock, hist, chip, margin, score) {
+  const tags   = [];
+  const chgPct = parseFloat(stock.changePct) || 0;
+  const vol    = stock.volume || 0;
+  const vol5avg = hist.length >= 5
+    ? hist.slice(-6,-1).reduce((s,h)=>s+(h.volume||0),0)/5 : 0;
+  const volRatio = vol5avg > 0 ? vol/vol5avg : 0;
+
+  if (chgPct >= 9.5) tags.push({text:"🔒 鎖漲停", cls:"hot"});
+  if (chgPct >= 8 && volRatio >= 1.5) tags.push({text:"🚀 快攻漲停", cls:"hot"});
+  if (score >= 80) tags.push({text:"🔥 強勢候選", cls:"hot"});
+  if (volRatio >= 2) tags.push({text:"💰 爆量攻擊", cls:"bull"});
+  if (chip && ((chip.site1>0)||(chip.foreign1>0))) tags.push({text:"🏦 法人點火", cls:"bull"});
+  // 追高風險（需要 ind.rsi，這裡用漲幅簡化）
+  if (chgPct >= 8 && chgPct < 9.5) tags.push({text:"⚠️ 追高風險", cls:"warn"});
+  return tags;
+}
+
+function getLimitUpSuggest(stock, score) {
+  const chgPct = parseFloat(stock.changePct) || 0;
+  if (chgPct >= 9.5) return "已接近漲停，注意是否開板與成交量變化";
+  if (chgPct >= 8)   return "攻擊力強，觀察是否帶量突破並封住漲停";
+  if (score >= 80)   return "動能強，留意是否挑戰漲停價";
+  return "漲幅已大，避免無停損追高";
+}
+
+async function _runLimitUpScan(poolCodes, limit, cacheKey) {
+  const t0 = Date.now();
+  log.info("limitup_scan_start", { pool: poolCodes.length });
+
+  // 取中文名稱對照
+  let nameMap = {};
+  try {
+    const fmList = await getStockList();
+    fmList.forEach(s=>{ if(s.name&&/[\u4e00-\u9fff]/.test(s.name)) nameMap[s.code]=s.name; });
+  } catch(e) {}
+
+  const BATCH = 50;
+  const results = [];
+
+  for (let i = 0; i < poolCodes.length; i += BATCH) {
+    if (Date.now() - t0 > 50000) { log.warn("limitup_timeout",{scanned:i}); break; }
+    const batch = poolCodes.slice(i, i + BATCH);
+    const tasks = batch.map(code => async () => {
+      try {
+        const r = await fetchYahooChart(code);
+        if (!r?.stock?.price) return null;
+        const chgPct = parseFloat(r.stock.changePct) || 0;
+        if (chgPct < 3) return null; // 漲幅 < 3% 直接跳過
+        const hist   = r.hist || [];
+        const chip   = cacheGet(`chip:${code}`).fresh   || cacheGet(`chip:${code}`).stale;
+        const margin = cacheGet(`margin:${code}`).fresh || cacheGet(`margin:${code}`).stale;
+        const lscore = calcLimitUpScore(r.stock, hist, chip, margin);
+        if (lscore < 10) return null; // 太低分跳過
+        const tags    = getLimitUpTags(r.stock, hist, chip, margin, lscore);
+        const suggest = getLimitUpSuggest(r.stock, lscore);
+        const prevClose = r.hist?.at(-2)?.close || r.stock.price;
+        const limitUpPrice = getLimitUpPrice(prevClose);
+        const vol5avg = hist.length >= 5
+          ? hist.slice(-6,-1).reduce((s,h)=>s+(h.volume||0),0)/5 : 0;
+        const volRatio = vol5avg > 0 ? +(r.stock.volume/vol5avg).toFixed(2) : 0;
+        return {
+          ...r.stock,
+          name: nameMap[code] || r.stock.name,
+          prevClose,
+          limitUpPrice,
+          distanceToLimitUp: limitUpPrice > 0
+            ? +((limitUpPrice - r.stock.price)/r.stock.price*100).toFixed(2) : 0,
+          limitUpScore: lscore,
+          volumeRatio: volRatio,
+          tags, suggest,
+        };
+      } catch(e) { return null; }
+    });
+    const batchRes = await runLimited(tasks, 5);
+    batchRes.forEach(s => { if(s) results.push(s); });
+  }
+
+  // 排序：limitUpScore → 漲幅 → volRatio
+  results.sort((a,b) =>
+    b.limitUpScore - a.limitUpScore ||
+    parseFloat(b.changePct) - parseFloat(a.changePct) ||
+    b.volumeRatio - a.volumeRatio
+  );
+  const top = results.slice(0, limit);
+
+  log.info("limitup_scan_done", { found: results.length, top: top.length, ms: Date.now()-t0 });
+
+  const resp = { mode:"limitup", stocks:top, time:new Date().toISOString(), _v:"limitup" };
+  cacheSet(cacheKey, resp, TTL.scan);
+  return resp;
+}
+
+
+// ════════════════════════════════════════════════════════
 // 族群熱度掃描
 // ════════════════════════════════════════════════════════
 async function _runSectorScan(poolCodes, limit, cacheKey) {
@@ -1179,6 +1346,21 @@ async function _runScan(mode,limit,cacheKey,universe="custom"){
     poolCodes=SCAN_STOCKS.map(s=>s.code);
   }
 
+  // limitup → 鎖漲停掃描（固定用 large 池）
+  if(mode==="limitup"){
+    let luPool=poolCodes;
+    if(luPool.length<100){
+      try{
+        const all=await getStockList();
+        const seen=new Set();
+        luPool=all.map(s=>s.code).filter(c=>{
+          if(!/^\d{4}$/.test(c)||seen.has(c))return false;
+          seen.add(c);return parseInt(c)>=1000&&parseInt(c)<=9999;
+        });
+      }catch(e){}
+    }
+    return await _runLimitUpScan(luPool,limit,cacheKey);
+  }
   // sector → 族群熱度掃描（固定用 large 池）
   if(mode==="sector"){
     // 如果目前 poolCodes 太少（custom），強制改用 large

@@ -240,17 +240,21 @@ async function getStockList(){
     const r=await fetchRetry(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo&token=${tok}`,{headers:{"User-Agent":"Mozilla/5.0"}},10e3,1);
     const raw=(await r.json())?.data||[];
     // 去重（同代號只保留中文名稱）+ 加 industry_category
-    const seen=new Set();
-    const list=raw.filter(s=>s.stock_id&&s.stock_name).filter(s=>{
-      if(seen.has(s.stock_id))return false;
-      // 有中文名稱的優先，英文重複的跳過
-      seen.add(s.stock_id); return true;
-    }).map(s=>({
-      code: s.stock_id,
-      name: s.stock_name,
-      type: s.type||"",
-      industry: s.industry_category||"", // 真正的產業分類
-    }));
+    // 先整理：同代號保留有中文名的那筆
+    const codeMap=new Map();
+    raw.filter(s=>s.stock_id&&s.stock_name).forEach(s=>{
+      const existing=codeMap.get(s.stock_id);
+      const hasChinese=/[\u4e00-\u9fff]/.test(s.stock_name);
+      if(!existing || hasChinese){
+        codeMap.set(s.stock_id,{
+          code: s.stock_id,
+          name: s.stock_name,
+          type: s.type||"",
+          industry: s.industry_category||"",
+        });
+      }
+    });
+    const list=[...codeMap.values()];
     if(list?.length>100){_sL=list;_sLts=Date.now();return list;}
   }catch(e){}}
   if(!_sL)_sL=BUILTIN_STOCK_LIST;
@@ -807,17 +811,17 @@ const SECTOR_MAP = {
   "半導體": ["2330","2303","2454","2379","2344","3034","3711","2408","2337","3533","2449","6770","3443","2351"],
   "電子組裝": ["2317","2382","2356","2354","2352","3231","2362","2365","4938","3702","2357","2353"],
   "伺服器/AI": ["2382","3231","6669","6789","3017","2345","5483","6235","3006","2353"],
-  "網通": ["2345","4904","3044","6443","6415","3149","4977","5285","8299","3706"],
+  "網通": ["2345","4904","3044","6443","6415","3149","4977","5285","8299","3706","3025","3041","6695","3704","3311"],
   "PCB": ["3037","2349","8046","3706","6183","3028","6269","2445","3189","3094"],
   "面板": ["2409","3481","5483","3673","6185","6443"],
-  "光電/LED": ["2448","3014","2393","3703","2455","6244","3035","2340"],
+  "光電/LED": ["2448","3014","2393","3703","2455","6244","3035","2340","6168","2426","3015","2489"],
   "金融": ["2881","2882","2891","2886","2884","2885","2892","2888","2887","2890","5880","2883","2889"],
   "航運": ["2603","2615","2609","2610","2612","2606","2608","2614","2616","2618"],
   "鋼鐵": ["2002","2006","2007","2008","2015","9910","2023","2025"],
   "汽車/電動車": ["2201","2207","1537","1590","6208","2208","1598","2231"],
   "生技醫療": ["4763","6547","1786","4174","6202","4188","6547","3719","4194","4155"],
   "電信": ["2412","3045","4904","4977"],
-  "電子零件": ["2327","2385","6116","2399","3189","6269","2492","2475","2321"],
+  "電子零件": ["2327","2385","6116","2399","3189","6269","2492","2475","2321","3528","2488","6282","2483","2484"],
   "高股息ETF": ["0050","0056","00878","00919","006208","00929","00713","00692"],
   "電源/被動": ["2308","2474","2492","3045","6121","2425","2327","1736"],
   "橡塑膠": ["1476","1477","1301","1303","1304","1308","2102","2103"],
@@ -924,7 +928,13 @@ async function _runMomentumScan(poolCodes, limit, cacheKey) {
   const t0 = Date.now();
   log.info("momentum_scan_start", { pool: poolCodes.length, limit });
 
-  // 分批抓 Yahoo chart（concurrency=5，每批最多 50 支）
+  // 取中文名稱對照表
+  let momNameMap = {};
+  try {
+    const fmList = await getStockList();
+    fmList.forEach(s => { if (s.name && /[\u4e00-\u9fff]/.test(s.name)) momNameMap[s.code] = s.name; });
+  } catch(e) {}
+
   const BATCH = 50;
   const results = [];
 
@@ -948,7 +958,9 @@ async function _runMomentumScan(poolCodes, limit, cacheKey) {
         const chip = cacheGet(`chip:${code}`).fresh || cacheGet(`chip:${code}`).stale;
         const ms   = calcMomentumScore(ind, chip, hist, r.stock);
         const mt   = getMomentumTags(ind, chip, hist, r.stock);
-        return { ...r.stock, momentumScore: ms, momentumTags: mt,
+        return { ...r.stock,
+          name: momNameMap[code] || r.stock.name,
+          momentumScore: ms, momentumTags: mt,
           ind, rsi: ind.rsi, maTrend: ind.maTrend };
       } catch(e) { return null; }
     });
@@ -1006,10 +1018,14 @@ async function _runSectorScan(poolCodes, limit, cacheKey) {
   const allStocks = [];
 
   // 同時取 FinMind 股票清單（含 industry_category）
-  let fmCategoryMap = {};
+  let fmCategoryMap = {}, fmNameMap = {};
   try {
     const fmList = await getStockList();
-    fmList.forEach(s => { if (s.industry) fmCategoryMap[s.code] = s.industry; });
+    fmList.forEach(s => {
+      if (s.industry) fmCategoryMap[s.code] = s.industry;
+      // 保留中文名稱對應
+      if (s.name && /[\u4e00-\u9fff]/.test(s.name)) fmNameMap[s.code] = s.name;
+    });
   } catch(e) {}
 
   for (let i = 0; i < poolCodes.length; i += BATCH) {
@@ -1039,6 +1055,7 @@ async function _runSectorScan(poolCodes, limit, cacheKey) {
 
         return {
           ...r.stock,
+          name: fmNameMap[code] || r.stock.name, // 優先用中文名
           momentumScore: ms,
           momentumTags: mt,
           sector,

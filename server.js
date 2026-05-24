@@ -1109,11 +1109,14 @@ async function _runLimitUpScan(poolCodes, limit, cacheKey) {
   const t0 = Date.now();
   log.info("limitup_scan_start", { pool: poolCodes.length });
 
-  // 取中文名稱對照
-  let nameMap = {};
+  // 取中文名稱 + 產業分類對照
+  let nameMap = {}, fmCategoryMap = {};
   try {
     const fmList = await getStockList();
-    fmList.forEach(s=>{ if(s.name&&/[\u4e00-\u9fff]/.test(s.name)) nameMap[s.code]=s.name; });
+    fmList.forEach(s=>{
+      if(s.name&&/[一-鿿]/.test(s.name)) nameMap[s.code]=s.name;
+      if(s.industry) fmCategoryMap[s.code]=s.industry;
+    });
   } catch(e) {}
 
   const BATCH = 50;

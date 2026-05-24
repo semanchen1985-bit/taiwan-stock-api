@@ -1143,9 +1143,11 @@ async function _runLimitUpScan(poolCodes, limit, cacheKey) {
         const vol5avg = hist.length >= 5
           ? hist.slice(-6,-1).reduce((s,h)=>s+(h.volume||0),0)/5 : 0;
         const volRatio = vol5avg > 0 ? +(r.stock.volume/vol5avg).toFixed(2) : 0;
+        const sector = getSector(code, fmCategoryMap[code]);
         return {
           ...r.stock,
           name: nameMap[code] || r.stock.name,
+          sector,
           prevClose,
           limitUpPrice,
           distanceToLimitUp: limitUpPrice > 0

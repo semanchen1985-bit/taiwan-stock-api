@@ -1134,6 +1134,9 @@ async function _runLimitUpScan(poolCodes, limit, cacheKey) {
         const hist   = r.hist || [];
         const chip   = cacheGet(`chip:${code}`).fresh   || cacheGet(`chip:${code}`).stale;
         const margin = cacheGet(`margin:${code}`).fresh || cacheGet(`margin:${code}`).stale;
+        const fund   = cacheGet(`fundamentals:${code}`).fresh || cacheGet(`fundamentals:${code}`).stale;
+        const rev    = cacheGet(`rev:${code}`).fresh    || cacheGet(`rev:${code}`).stale;
+        const ind    = calcIndicators(hist, r.stock.price);
         const lscore = calcLimitUpScore(r.stock, hist, chip, margin);
         if (lscore < 10) return null; // 太低分跳過
         const tags    = getLimitUpTags(r.stock, hist, chip, margin, lscore);
@@ -1144,6 +1147,7 @@ async function _runLimitUpScan(poolCodes, limit, cacheKey) {
           ? hist.slice(-6,-1).reduce((s,h)=>s+(h.volume||0),0)/5 : 0;
         const volRatio = vol5avg > 0 ? +(r.stock.volume/vol5avg).toFixed(2) : 0;
         const sector = getSector(code, fmCategoryMap[code]);
+        const sc = calcStockScore(ind, chip, margin, fund, rev, hist, r.stock.price);
         return {
           ...r.stock,
           name: nameMap[code] || r.stock.name,
@@ -1155,6 +1159,15 @@ async function _runLimitUpScan(poolCodes, limit, cacheKey) {
           limitUpScore: lscore,
           volumeRatio: volRatio,
           tags, suggest,
+          // 評分細項（跟其他模式一致）
+          score: sc.score, grade: sc.grade, gradeColor: sc.gradeColor,
+          scoreDetail: sc.detail,
+          fundScore:   sc.detail._fund   || 0,
+          techScore:   sc.detail._tech   || 0,
+          volScore:    sc.detail._vol    || 0,
+          chipScore:   sc.detail._chip   || 0,
+          marginScore: sc.detail._margin || 0,
+          themeScore:  sc.detail._theme  || 0,
         };
       } catch(e) { return null; }
     });

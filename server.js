@@ -1007,6 +1007,219 @@ async function _runMomentumScan(poolCodes, limit, cacheKey) {
 
 
 // ════════════════════════════════════════════════════════
+// 處置股策略 — 使用富果 API
+// ════════════════════════════════════════════════════════
+const FUGLE_KEY = () => process.env.FUGLE_API_KEY || "";
+const FUGLE_BASE = "https://api.fugle.tw/marketdata/v1.0/stock";
+
+async function fetchFugleTickers(params) {
+  if (!FUGLE_KEY()) return [];
+  try {
+    const qs = Object.entries(params).map(([k,v])=>`${k}=${v}`).join("&");
+    const r = await fetchRetry(`${FUGLE_BASE}/intraday/tickers?${qs}`, {
+      headers: { "X-API-KEY": FUGLE_KEY(), "Accept": "application/json" }
+    }, 8000, 1);
+    const d = await r.json();
+    return d?.data || [];
+  } catch(e) {
+    log.warn("fugle_tickers_fail", { msg: e.message });
+    return [];
+  }
+}
+
+async function getDispositionList() {
+  const cacheKey = "disposition:list";
+  const { fresh } = cacheGet(cacheKey);
+  if (fresh) return fresh;
+
+  const [attList, disList] = await Promise.all([
+    fetchFugleTickers({ type:"EQUITY", isAttention:"true" }),
+    fetchFugleTickers({ type:"EQUITY", isDisposition:"true" }),
+  ]);
+
+  const attSet = new Set(attList.map(s => s.symbol));
+  const disSet = new Set(disList.map(s => s.symbol));
+
+  // 合併名稱對照
+  const nameMap = {};
+  [...attList, ...disList].forEach(s => { nameMap[s.symbol] = s.name; });
+
+  const result = { attSet, disSet, nameMap };
+  cacheSet(cacheKey, result, 30 * 60e3); // cache 30 分鐘
+  log.info("disposition_list", { attention: attSet.size, disposition: disSet.size });
+  return result;
+}
+
+function calcDispositionScore(stock, hist, chip, attSet, disSet) {
+  let score = 0;
+  const code = stock.code;
+  const price = stock.price || 0;
+
+  // 1. 是否為處置股（30分）
+  if (disSet.has(code)) score += 30;
+  // 2. 是否為注意股（20分）
+  else if (attSet.has(code)) score += 20;
+
+  // 3. 近5日漲幅 > 20%（15分）
+  if (hist.length >= 6) {
+    const p5 = hist.at(-6)?.close || price;
+    const change5 = p5 > 0 ? (price - p5) / p5 * 100 : 0;
+    if (change5 >= 20)      score += 15;
+    else if (change5 >= 10) score += 8;
+  }
+
+  // 4. 近10日漲幅 > 30%（15分）
+  if (hist.length >= 11) {
+    const p10 = hist.at(-11)?.close || price;
+    const change10 = p10 > 0 ? (price - p10) / p10 * 100 : 0;
+    if (change10 >= 30)      score += 15;
+    else if (change10 >= 15) score += 7;
+  }
+
+  // 5. 成交量 > 5日均量 2倍（10分）
+  const vol = stock.volume || 0;
+  const vol5avg = hist.length >= 5
+    ? hist.slice(-6,-1).reduce((s,h)=>s+(h.volume||0),0)/5 : 0;
+  const volRatio = vol5avg > 0 ? vol / vol5avg : 0;
+  if (volRatio >= 2)        score += 10;
+  else if (volRatio >= 1.5) score += 5;
+
+  // 6. 多頭排列（10分）
+  const closes = hist.map(h => h.close);
+  const ma = n => closes.length >= n ? closes.slice(-n).reduce((s,v)=>s+v,0)/n : null;
+  const ma5=ma(5), ma10=ma(10), ma20=ma(20);
+  if (ma5 && ma10 && ma20 && ma5>ma10 && ma10>ma20 && price>ma20) score += 10;
+
+  return Math.min(100, Math.round(score));
+}
+
+function getDispositionTags(stock, hist, chip, attSet, disSet, score) {
+  const tags = [];
+  const code = stock.code;
+  const price = stock.price || 0;
+  const vol = stock.volume || 0;
+  const vol5avg = hist.length >= 5
+    ? hist.slice(-6,-1).reduce((s,h)=>s+(h.volume||0),0)/5 : 0;
+  const volRatio = vol5avg > 0 ? vol / vol5avg : 0;
+
+  if (disSet.has(code)) tags.push({text:"⚠️ 處置股", cls:"warn"});
+  if (attSet.has(code)) tags.push({text:"👀 注意股", cls:"warn"});
+
+  // 近5日漲幅
+  const change5 = hist.length >= 6
+    ? (price - (hist.at(-6)?.close||price)) / (hist.at(-6)?.close||price) * 100 : 0;
+  if (change5 >= 20 && volRatio >= 1.5)
+    tags.push({text:"🔥 高人氣強勢", cls:"hot"});
+
+  // 多頭排列
+  const closes = hist.map(h=>h.close);
+  const ma = n => closes.length>=n ? closes.slice(-n).reduce((s,v)=>s+v,0)/n : null;
+  const ma5=ma(5), ma10=ma(10), ma20=ma(20);
+  if (ma5&&ma10&&ma20&&ma5>ma10&&ma10>ma20&&price>ma20)
+    tags.push({text:"📈 仍在多頭", cls:"bull"});
+
+  // 冷卻中（處置期間量縮）
+  if (disSet.has(code) && volRatio < 0.8)
+    tags.push({text:"🧊 冷卻中", cls:"neutral"});
+
+  return tags;
+}
+
+function getDispositionSuggest(stock, attSet, disSet, score) {
+  const code = stock.code;
+  if (disSet.has(code)) return "目前為處置股，波動大，注意分盤交易與流動性風險";
+  if (attSet.has(code)) return "目前為注意股，短線熱度高，留意是否進入處置";
+  if (score >= 70)      return "短線漲幅大且量能放大，屬於高人氣強勢股";
+  return "觀察中";
+}
+
+async function _runDispositionScan(limit, cacheKey) {
+  const t0 = Date.now();
+  log.info("disposition_scan_start");
+
+  if (!FUGLE_KEY()) {
+    return { mode:"disposition", stocks:[], error:"未設定 FUGLE_API_KEY", time:new Date().toISOString() };
+  }
+
+  // 取注意股 + 處置股清單
+  const { attSet, disSet, nameMap } = await getDispositionList();
+  const allCodes = [...new Set([...attSet, ...disSet])];
+
+  if (!allCodes.length) {
+    return { mode:"disposition", stocks:[], time:new Date().toISOString(), _v:"disposition" };
+  }
+
+  log.info("disposition_codes", { count: allCodes.length });
+
+  // 批次抓 Yahoo chart
+  const results = [];
+  const BATCH = 20;
+  for (let i = 0; i < allCodes.length; i += BATCH) {
+    if (Date.now() - t0 > 45000) break;
+    const batch = allCodes.slice(i, i + BATCH);
+    const tasks = batch.map(code => async () => {
+      try {
+        const r = await fetchYahooChart(code);
+        if (!r?.stock?.price) return null;
+        const hist = r.hist || [];
+        const chip = cacheGet(`chip:${code}`).fresh || cacheGet(`chip:${code}`).stale;
+        const dscore = calcDispositionScore(r.stock, hist, chip, attSet, disSet);
+        const tags   = getDispositionTags(r.stock, hist, chip, attSet, disSet, dscore);
+        const suggest= getDispositionSuggest(r.stock, attSet, disSet, dscore);
+
+        // 5日/10日漲幅
+        const price = r.stock.price;
+        const fiveDayChange = hist.length >= 6
+          ? +((price-(hist.at(-6)?.close||price))/(hist.at(-6)?.close||price)*100).toFixed(2) : 0;
+        const tenDayChange = hist.length >= 11
+          ? +((price-(hist.at(-11)?.close||price))/(hist.at(-11)?.close||price)*100).toFixed(2) : 0;
+        const vol5avg = hist.length >= 5
+          ? hist.slice(-6,-1).reduce((s,h)=>s+(h.volume||0),0)/5 : 0;
+        const volRatio = vol5avg > 0 ? +(r.stock.volume/vol5avg).toFixed(2) : 0;
+
+        // calcStockScore
+        const ind    = calcIndicators(hist, price);
+        const margin = cacheGet(`margin:${code}`).fresh || cacheGet(`margin:${code}`).stale;
+        const fund   = cacheGet(`fundamentals:${code}`).fresh || cacheGet(`fundamentals:${code}`).stale;
+        const rev    = cacheGet(`rev:${code}`).fresh || cacheGet(`rev:${code}`).stale;
+        const sc     = calcStockScore(ind, chip, margin, fund, rev, hist, price);
+
+        return {
+          ...r.stock,
+          name: nameMap[code] || r.stock.name,
+          dispositionType: disSet.has(code) ? "處置股" : attSet.has(code) ? "注意股" : "一般",
+          dispositionScore: dscore,
+          fiveDayChange, tenDayChange, volRatio,
+          tags, suggest,
+          score: sc.score, grade: sc.grade, gradeColor: sc.gradeColor,
+          scoreDetail: sc.detail,
+          fundScore: sc.detail._fund||0, techScore: sc.detail._tech||0,
+          volScore: sc.detail._vol||0, chipScore: sc.detail._chip||0,
+          marginScore: sc.detail._margin||0, themeScore: sc.detail._theme||0,
+        };
+      } catch(e) { return null; }
+    });
+    const batchRes = await runLimited(tasks, 5);
+    batchRes.forEach(s => { if(s) results.push(s); });
+  }
+
+  // 排序：處置股 > 注意股 > score > 5日漲幅
+  results.sort((a,b) => {
+    const at = t => t==="處置股"?2:t==="注意股"?1:0;
+    return at(b.dispositionType)-at(a.dispositionType)
+      || b.dispositionScore-a.dispositionScore
+      || b.fiveDayChange-a.fiveDayChange;
+  });
+
+  const top = results.slice(0, limit);
+  log.info("disposition_scan_done", { found: results.length, ms: Date.now()-t0 });
+
+  const resp = { mode:"disposition", stocks:top, time:new Date().toISOString(), _v:"disposition" };
+  cacheSet(cacheKey, resp, TTL.scan);
+  return resp;
+}
+
+// ════════════════════════════════════════════════════════
 // 鎖漲停策略
 // ════════════════════════════════════════════════════════
 function getLimitUpPrice(prevClose) {
@@ -1364,6 +1577,10 @@ async function _runScan(mode,limit,cacheKey,universe="custom"){
     poolCodes=SCAN_STOCKS.map(s=>s.code);
   }
 
+  // disposition → 處置股掃描
+  if(mode==="disposition"){
+    return await _runDispositionScan(limit,cacheKey);
+  }
   // limitup → 鎖漲停掃描（固定用 large 池）
   if(mode==="limitup"){
     let luPool=poolCodes;

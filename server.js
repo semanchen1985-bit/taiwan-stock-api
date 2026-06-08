@@ -1399,7 +1399,39 @@ async function _runLimitUpScan(poolCodes, limit, cacheKey) {
   log.info("limitup_scan_done", { found: results.length, top: top.length, ms: Date.now()-t0 });
 
   const resp = { mode:"limitup", stocks:top, time:new Date().toISOString(), _v:"limitup" };
-  cacheSet(cacheKey, resp, TTL.scan);
+
+  // 盤後（13:30 後）保留到明天 8:30，盤中用一般 5 分鐘
+  function msUntilNextOpen() {
+    const now = new Date();
+    // 轉台灣時間（UTC+8）
+    const twNow = new Date(now.getTime() + 8*3600e3);
+    const h = twNow.getUTCHours(), m = twNow.getUTCMinutes();
+    const minOfDay = h * 60 + m;
+    const marketOpen  = 9  * 60;      // 9:00
+    const marketClose = 13 * 60 + 30; // 13:30
+    const nextOpen    = 8  * 60 + 30; // 明天 8:30
+
+    if (minOfDay >= marketClose || minOfDay < marketOpen) {
+      // 盤後或盤前：算到明天 8:30
+      let msToNextOpen;
+      if (minOfDay >= nextOpen && minOfDay < marketOpen) {
+        // 今天 8:30~9:00 之間：幾分鐘後開盤，短 cache
+        msToNextOpen = TTL.scan;
+      } else if (minOfDay >= marketClose) {
+        // 今天收盤後：到明天 8:30
+        const minsLeft = (24*60 - minOfDay) + nextOpen;
+        msToNextOpen = minsLeft * 60e3;
+      } else {
+        // 深夜到明天 8:30
+        const minsLeft = nextOpen - minOfDay;
+        msToNextOpen = minsLeft * 60e3;
+      }
+      return Math.max(msToNextOpen, TTL.scan);
+    }
+    return TTL.scan; // 盤中用一般 TTL
+  }
+
+  cacheSet(cacheKey, resp, msUntilNextOpen());
   return resp;
 }
 

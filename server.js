@@ -1668,7 +1668,7 @@ async function _runScan(mode,limit,cacheKey,universe="custom"){
   }
   let stocks=SCAN_STOCKS.map(s=>priceMap.get(s.code)).filter(s=>s?.price>0);
   if(!stocks.length)throw new Error("no_price_data");
-  stocks.sort((a,b)=>mode==="change"?parseFloat(b.changePct)-parseFloat(a.changePct):mode==="momentum"?parseFloat(b.changePct)-parseFloat(a.changePct):b.volume-a.volume);
+  stocks.sort((a,b)=>mode==="change"?parseFloat(b.changePct)-parseFloat(a.changePct):mode==="drop"?parseFloat(a.changePct)-parseFloat(b.changePct):mode==="momentum"?parseFloat(b.changePct)-parseFloat(a.changePct):b.volume-a.volume);
   stocks=stocks.slice(0,limit);tick();
   const results=stocks.map(stock=>{
     try{
